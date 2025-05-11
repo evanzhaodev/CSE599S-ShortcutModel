@@ -6,7 +6,7 @@ from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
     # Original JAX code: x * (1 + scale[:, None]) + shift[:, None]
-    scale = torch.clamp(scale, -1, 1)
+    # scale = torch.clamp(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -266,7 +266,7 @@ class DiTBlock(nn.Module):
         v = v.reshape(B, N, self.num_heads, channels_per_head)
         
         # Scale query
-        q = q / math.sqrt(channels_per_head)
+        q = q / math.sqrt(3)
         
         # Compute attention
         attn = torch.einsum('bqhc,bkhc->bhqk', q, k)
@@ -446,4 +446,4 @@ class DiT(nn.Module):
         
         if return_activations:
             return x, logvars, activations
-        return x, logvars
+        return x
