@@ -342,7 +342,7 @@ class DiT(nn.Module):
         num_classes,
         ignore_dt=False,
         dropout=0.0,
-        dtype=torch.bfloat16
+        dtype=torch.float32
     ):
         super().__init__()
         self.patch_size = patch_size
