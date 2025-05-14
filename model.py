@@ -170,36 +170,45 @@ class MlpBlock(nn.Module):
         self.out_dim = out_dim
         self.dropout_rate = dropout_rate
         
-        # These will be set properly in forward
-        self.fc1 = None
-        self.fc2 = None
+        # Pre-initialize the layers with default sizes to match the saved state dict
+        self.fc1 = nn.Linear(768, mlp_dim)  # Default hidden size is typically 768
+        self.fc2 = nn.Linear(mlp_dim, 768)  # Default output is same as input
+        
+        # Initialize weights
+        self.tc.kern_init()(self.fc1)
+        self.tc.kern_init()(self.fc2)
+        
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate is not None else nn.Identity()
     
-    def _create_fc1(self, in_dim, device):
-        self.fc1 = nn.Linear(in_dim, self.mlp_dim).to(device)
-        self.tc.kern_init()(self.fc1)
-        return self.fc1
-    
-    def _create_fc2(self, out_dim, device):
-        self.fc2 = nn.Linear(self.mlp_dim, out_dim).to(device)
-        self.tc.kern_init()(self.fc2)
-        return self.fc2
+    def _update_fc1_if_needed(self, in_dim, device):
+        # If dimensions don't match, recreate the layer
+        if self.fc1.in_features != in_dim:
+            old_fc1 = self.fc1
+            self.fc1 = nn.Linear(in_dim, self.mlp_dim).to(device)
+            self.tc.kern_init()(self.fc1)
+            
+    def _update_fc2_if_needed(self, out_dim, device):
+        # If dimensions don't match, recreate the layer
+        if self.fc2.out_features != out_dim:
+            old_fc2 = self.fc2
+            self.fc2 = nn.Linear(self.mlp_dim, out_dim).to(device)
+            self.tc.kern_init()(self.fc2)
         
     def forward(self, inputs, train=False):
         device = inputs.device
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
         
-        # Initialize the layers with correct dimensions if not done yet
-        if self.fc1 is None or self.fc1.in_features != inputs.shape[-1]:
-            self.fc1 = self._create_fc1(inputs.shape[-1], device)
-        elif self.fc1.weight.device != device:
-            self.fc1 = self.fc1.to(device)
+        # Update layers if dimensions don't match
+        self._update_fc1_if_needed(inputs.shape[-1], device)
+        self._update_fc2_if_needed(actual_out_dim, device)
         
-        if self.fc2 is None or self.fc2.out_features != actual_out_dim:
-            self.fc2 = self._create_fc2(actual_out_dim, device)
-        elif self.fc2.weight.device != device:
+        # Move layers to the correct device if needed
+        if self.fc1.weight.device != device:
+            self.fc1 = self.fc1.to(device)
+        if self.fc2.weight.device != device:
             self.fc2 = self.fc2.to(device)
         
+        # Forward pass
         x = self.fc1(inputs)
         x = F.gelu(x)
         x = self.dropout(x) if train else x
