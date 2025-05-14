@@ -388,7 +388,7 @@ class DiT(nn.Module):
         
     def forward(self, x, t, dt, y, train=False, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
-        print(f"DiT: Input of shape {x.shape} dtype {x.dtype}")
+        # print(f"DiT: Input of shape {x.shape} dtype {x.dtype}")
         activations = {}
         
         batch_size = x.shape[0]
@@ -406,7 +406,7 @@ class DiT(nn.Module):
         
         # Patch embedding
         x = self.patch_embed(x)  # (B, num_patches, hidden_size)
-        print(f"DiT: After patch embed, shape is {x.shape} dtype {x.dtype}")
+        # print(f"DiT: After patch embed, shape is {x.shape} dtype {x.dtype}")
         activations['patch_embed'] = x
         
         # Add positional embedding
@@ -426,8 +426,8 @@ class DiT(nn.Module):
         activations['label_embed'] = ye
         activations['conditioning'] = c
         
-        print(f"DiT: Patch Embed of shape {x.shape} dtype {x.dtype}")
-        print(f"DiT: Conditioning of shape {c.shape} dtype {c.dtype}")
+        # print(f"DiT: Patch Embed of shape {x.shape} dtype {x.dtype}")
+        # print(f"DiT: Conditioning of shape {c.shape} dtype {c.dtype}")
         
         # Apply transformer blocks
         for i in range(self.depth):
