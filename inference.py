@@ -48,23 +48,32 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         depth=config['depth'],
         num_heads=config['num_heads'],
         mlp_ratio=config['mlp_ratio'],
-        out_channels=config.get('image_channels', 4 if config['use_stable_vae'] else 3),
+        out_channels=config.get('image_channels', 4 if config.get('use_stable_vae', False) else 3),
         class_dropout_prob=0.1,  # Not used but keep as in original
         num_classes=1,  # Unconditional
         dropout=config.get('dropout', 0.0),
         ignore_dt=False
     )
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        # First try loading with weights_only=True (safer)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+    except Exception as e:
+        print(f"Warning: Could not load checkpoint with weights_only=True. Trying with weights_only=False: {e}")
+        # Fall back to weights_only=False if needed
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     # Load weights
-    if use_ema and 'ema_model' in checkpoint:
+    if use_ema and isinstance(checkpoint, dict) and 'ema_model' in checkpoint:
         model.load_state_dict(checkpoint['ema_model'])
         print("Loaded EMA model weights")
-    else:
+    elif isinstance(checkpoint, dict) and 'model' in checkpoint:
         model.load_state_dict(checkpoint['model'])
         print("Loaded model weights")
+    else:
+        # Assume checkpoint is just the model state dict
+        model.load_state_dict(checkpoint)
+        print("Loaded model weights directly")
     
     model.to(device)
     model.eval()
