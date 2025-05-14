@@ -175,25 +175,30 @@ class MlpBlock(nn.Module):
         self.fc2 = None
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate is not None else nn.Identity()
     
-    def _create_fc1(self, in_dim):
-        self.fc1 = nn.Linear(in_dim, self.mlp_dim)
+    def _create_fc1(self, in_dim, device):
+        self.fc1 = nn.Linear(in_dim, self.mlp_dim).to(device)
         self.tc.kern_init()(self.fc1)
         return self.fc1
     
-    def _create_fc2(self, out_dim):
-        self.fc2 = nn.Linear(self.mlp_dim, out_dim)
+    def _create_fc2(self, out_dim, device):
+        self.fc2 = nn.Linear(self.mlp_dim, out_dim).to(device)
         self.tc.kern_init()(self.fc2)
         return self.fc2
         
     def forward(self, inputs, train=False):
+        device = inputs.device
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
         
         # Initialize the layers with correct dimensions if not done yet
         if self.fc1 is None or self.fc1.in_features != inputs.shape[-1]:
-            self.fc1 = self._create_fc1(inputs.shape[-1])
+            self.fc1 = self._create_fc1(inputs.shape[-1], device)
+        elif self.fc1.weight.device != device:
+            self.fc1 = self.fc1.to(device)
         
         if self.fc2 is None or self.fc2.out_features != actual_out_dim:
-            self.fc2 = self._create_fc2(actual_out_dim)
+            self.fc2 = self._create_fc2(actual_out_dim, device)
+        elif self.fc2.weight.device != device:
+            self.fc2 = self.fc2.to(device)
         
         x = self.fc1(inputs)
         x = F.gelu(x)
