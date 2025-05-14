@@ -136,7 +136,7 @@ class PatchEmbed(nn.Module):
         self.bias = bias
         
         self.proj = nn.Conv2d(
-            in_channels=3,  # Assuming RGB images
+            in_channels=4,  # Latent space channels
             out_channels=hidden_size,
             kernel_size=(patch_size, patch_size),
             stride=(patch_size, patch_size),
