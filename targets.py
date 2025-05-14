@@ -76,7 +76,11 @@ def get_targets(
     
     # 2) =========== Sample t. ============
     dt_sections = torch.pow(2, dt_base)  # [1, 2, 4, 8, 16, 32]
-    t = torch.randint(0, dt_sections.long(), (bootstrap_batchsize,), device=device).float()
+    
+    # Generate uniform random values between 0 and 1, then scale by dt_sections
+    t_rand = torch.rand(bootstrap_batchsize, device=device)
+    t = (t_rand * dt_sections).floor()  # Random integers in [0, dt_sections)
+    
     t = t / dt_sections  # Between 0 and 1.
     force_t_vec = torch.ones(bootstrap_batchsize, device=device) * force_t
     t = torch.where(force_t_vec != -1, force_t_vec, t)
