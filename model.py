@@ -126,6 +126,23 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
+class CLIPEmbedder(nn.Module):
+    """
+    Processes CLIP embeddings to match the hidden size
+    """
+    def __init__(self, hidden_size, tc):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.tc = tc
+        
+        # Project CLIP embeddings (768) to hidden size
+        self.projection = nn.Linear(768, hidden_size)
+        self.tc.kern_init()(self.projection)
+    
+    def forward(self, embeddings):
+        # Project to the correct dimension
+        return self.projection(embeddings)
+
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     def __init__(self, patch_size, hidden_size, tc, bias=True):
@@ -356,6 +373,7 @@ class DiT(nn.Module):
         num_classes,
         ignore_dt=False,
         dropout=0.0,
+        is_image=False,
         dtype=torch.float32
     ):
         super().__init__()
@@ -381,6 +399,7 @@ class DiT(nn.Module):
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.dt_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.label_embedder = LabelEmbedder(num_classes, hidden_size, tc=self.tc)
+        self.clip_embedder = CLIPEmbedder(hidden_size, tc=self.tc)
         
         # DiT blocks
         self.blocks = nn.ModuleList([
@@ -425,7 +444,10 @@ class DiT(nn.Module):
         # Time, dt, and label embeddings
         te = self.timestep_embedder(t)  # (B, hidden_size)
         dte = self.dt_embedder(dt)  # (B, hidden_size)
-        ye = self.label_embedder(y)  # (B, hidden_size)
+        if self.is_image:
+            ye = self.clip_embedder(y)  # (B, hidden_size)
+        else:
+            ye = self.label_embedder(y)  # (B, hidden_size)
         c = te + ye + dte
         
         # Store activations

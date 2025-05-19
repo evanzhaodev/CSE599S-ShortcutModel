@@ -109,7 +109,7 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         num_classes=1,  # We'll use CLIP embeddings instead
         dropout=config.get('dropout', 0.0),
         ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        is_image=True
     )
     
     try:
