@@ -96,7 +96,7 @@ def create_dataloaders(
     batch_size: int, 
     image_size: int = 256,
     low_res_factor: int = 4,
-    num_workers: int = 16,
+    num_workers: int = 4,
     max_train_images: Optional[int] = None,
     max_val_images: Optional[int] = None
 ) -> Tuple[DataLoader, DataLoader]:

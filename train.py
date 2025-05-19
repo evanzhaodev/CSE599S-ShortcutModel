@@ -59,7 +59,7 @@ def parse_args():
     parser.add_argument('--log_interval', type=int, default=100, help='Logging interval')
     parser.add_argument('--use_cosine', action='store_true', help='Use cosine learning rate')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--num_workers', type=int, default=16, help='Number of workers for dataloader')
+    parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for dataloader')
     
     # Shortcut model arguments
     parser.add_argument('--denoise_timesteps', type=int, default=128, help='Number of denoising timesteps')
@@ -146,8 +146,7 @@ def main():
         class_dropout_prob=0.1,  # Not used in our case but keep as in original
         num_classes=1,  # Unconditional
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=True
+        ignore_dt=False
     )
     model.to(device)
     
@@ -169,8 +168,7 @@ def main():
         class_dropout_prob=0.1,
         num_classes=1,
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=True
+        ignore_dt=False
     )
     ema_model.to(device)
     # Initialize EMA model with model weights
@@ -244,7 +242,7 @@ def main():
             )
             
             # Forward pass
-            v_pred = model(x_t, t, dt_base, x_lr)
+            v_pred = model(x_t, t, dt_base, labels)
             
             # Compute loss
             mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
@@ -328,7 +326,7 @@ def main():
                         labels_val = torch.zeros(batch_size, dtype=torch.long, device=device)
                         
                         # Forward pass
-                        v_pred_val = model(x_t_val, t_val, dt_base_val, x_lr_val)
+                        v_pred_val = model(x_t_val, t_val, dt_base_val, labels_val)
                         
                         # Compute loss
                         mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
@@ -473,7 +471,7 @@ def generate_sample(model, x_0, steps=1, device=None):
     for step in range(steps):
         # Forward pass to get velocity
         with torch.no_grad():
-            v = model(x, t, dt_base, x_0)
+            v = model(x, t, dt_base, labels)
         
         # Update x using Euler method
         x = x + v * d
