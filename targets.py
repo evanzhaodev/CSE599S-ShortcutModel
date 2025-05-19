@@ -42,6 +42,7 @@ def get_targets(
         
     Returns:
         Tuple of (x_t, v_t, t, dt_base, labels, info)
+        Note: The caller is responsible for providing CLIP embeddings instead of labels
     """
     info = {}
     
@@ -90,7 +91,10 @@ def get_targets(
     bst_x1 = x_1[:bootstrap_batchsize]
     bst_x0 = x_0[:bootstrap_batchsize]
     x_t = (1 - (1 - 1e-5) * t_full) * bst_x0 + t_full * bst_x1
-    bst_labels = torch.zeros(bootstrap_batchsize, dtype=torch.long, device=device)  # Unconditional
+    
+    # Note: The caller needs to provide actual CLIP embeddings for these values
+    # This is a placeholder that will be replaced in the training loop
+    bst_labels = torch.zeros(bootstrap_batchsize, dtype=torch.long, device=device)  # Placeholder
     
     if model is not None:
         call_model_fn = model if not bootstrap_ema else model.ema_model if hasattr(model, 'ema_model') else model
@@ -146,8 +150,10 @@ def get_targets(
     bst_l = bst_labels
     
     # 4) =========== Generate Flow-Matching Targets ============
-    # For unconditional super-resolution
-    labels_dropped = torch.zeros(x_1.shape[0], dtype=torch.long, device=device)
+    # For super-resolution with CLIP conditioning
+    # Note: The caller needs to provide actual CLIP embeddings for these values
+    # This is a placeholder that will be replaced in the training loop
+    labels_dropped = torch.zeros(x_1.shape[0], dtype=torch.long, device=device)  # Placeholder
     
     # Sample t for flow matching
     t = torch.randint(0, denoise_timesteps, (x_1.shape[0],), device=device).float()
