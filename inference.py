@@ -164,7 +164,7 @@ def generate_sample(model, x_0, steps=1, device=None):
     for step in range(steps):
         # Forward pass to get velocity
         with torch.no_grad():
-            v = model(x, t, dt_base, labels)
+            v = model(x, t, dt_base, x_0)
         
         # Update x using Euler method
         x = x + v * d

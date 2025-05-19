@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+import segmentation_models_pytorch as smp
+
 def modulate(x, shift, scale):
     # Original JAX code: x * (1 + scale[:, None]) + shift[:, None]
     # scale = torch.clamp(scale, -1, 1)
@@ -125,6 +127,17 @@ class LabelEmbedder(nn.Module):
     def forward(self, labels):
         embeddings = self.embedding_table(labels)
         return embeddings
+
+class ImageEmbedder(nn.Module):
+    """
+    Embeds 2D images into vector representations using features extracted through CNN networks
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.feature_extractor = smp.Unet('tu-mobilenetv4_conv_small', classes=hidden_size, in_channels=4)
+    
+    def forward(self, imgs):
+        return self.feature_extractor(imgs)
 
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
@@ -356,6 +369,7 @@ class DiT(nn.Module):
         num_classes,
         ignore_dt=False,
         dropout=0.0,
+        is_image=True,
         dtype=torch.float32
     ):
         super().__init__()
@@ -369,6 +383,7 @@ class DiT(nn.Module):
         self.num_classes = num_classes
         self.ignore_dt = ignore_dt
         self.dropout = dropout
+        self.is_image = is_image
         self.dtype = dtype
         
         # Create training config
@@ -381,6 +396,9 @@ class DiT(nn.Module):
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.dt_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.label_embedder = LabelEmbedder(num_classes, hidden_size, tc=self.tc)
+
+        # image embedder
+        self.image_embedder = ImageEmbedder(hidden_size)
         
         # DiT blocks
         self.blocks = nn.ModuleList([
@@ -422,10 +440,15 @@ class DiT(nn.Module):
         x = x + pos_embed
         x = x.to(self.dtype)
         
-        # Time, dt, and label embeddings
+        # Time, dt, and label/image embeddings
         te = self.timestep_embedder(t)  # (B, hidden_size)
         dte = self.dt_embedder(dt)  # (B, hidden_size)
-        ye = self.label_embedder(y)  # (B, hidden_size)
+
+        if self.is_image:
+            ye = self.image_embedder(y)  # (B, hidden_size)
+        else:
+            ye = self.label_embedder(y)  # (B, hidden_size)
+
         c = te + ye + dte
         
         # Store activations
