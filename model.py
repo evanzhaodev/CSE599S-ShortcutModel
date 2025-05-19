@@ -137,7 +137,7 @@ class ImageEmbedder(nn.Module):
         self.feature_extractor = smp.Unet('tu-mobilenetv4_conv_small', classes=hidden_size, in_channels=4)
     
     def forward(self, imgs):
-        return self.feature_extractor(imgs)
+        return self.feature_extractor(torch.permute(imgs, (0, 3, 1, 2)))
 
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
