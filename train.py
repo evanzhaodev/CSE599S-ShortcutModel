@@ -12,7 +12,6 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import random
 import torchvision
-from transformers import CLIPProcessor, CLIPVisionModel
 
 from model import DiT
 from dataset import create_dataloaders
@@ -84,108 +83,6 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def create_clip_embedder():
-    """Create a CLIP vision model for image embeddings"""
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-    model.eval()  # Set to evaluation mode
-    
-    # Freeze the model parameters
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    return processor, model
-
-def get_clip_embeddings(images, processor, clip_model, device):
-    """
-    Get CLIP embeddings for images
-    
-    Args:
-        images: Images tensor in range [-1, 1], shape [B, H, W, C]
-        processor: CLIP processor
-        clip_model: CLIP vision model
-        device: Device to use
-        
-    Returns:
-        Embeddings tensor, shape [B, 768]
-    """
-    # Convert from [-1, 1] to [0, 1] range
-    images = (images + 1) / 2
-    
-    # Convert to correct format for CLIP
-    images = images.permute(0, 3, 1, 2)  # [B, C, H, W]
-    images = images * 255
-    
-    # Convert to PIL images for the processor
-    processed_images = []
-    for img in images:
-        # Ensure we have 3 channels (RGB)
-        if img.shape[0] == 4:  # If 4 channels, take first 3
-            img = img[:3]
-        
-        # Resize to CLIP expected size
-        img = F.interpolate(img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-        processed_images.append(img.cpu())
-    
-    # Process images with CLIP processor
-    pixel_values = processor(images=processed_images, return_tensors="pt").pixel_values
-    pixel_values = pixel_values.to(device)
-    
-    # Get embeddings from CLIP model
-    with torch.no_grad():
-        outputs = clip_model(pixel_values)
-        embeddings = outputs.pooler_output  # [B, 768]
-    
-    return embeddings
-
-def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
-    """
-    Generate sample using the shortcut model.
-    
-    Args:
-        model: Shortcut model
-        x_0: Low-resolution input [B, H, W, C]
-        clip_embeddings: CLIP embeddings for conditioning
-        steps: Number of denoising steps
-        device: Device to use
-        
-    Returns:
-        Generated high-resolution image [B, H, W, C]
-    """
-    if device is None:
-        device = next(model.parameters()).device
-    
-    batch_size = x_0.shape[0]
-    
-    # Start from low-resolution image
-    x = x_0.clone()
-    
-    # Calculate step size
-    d = 1.0 / steps
-    
-    # Initialize current time
-    t = torch.zeros(batch_size, device=device)
-    
-    # For timestep conditioning
-    dt_base = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(steps))
-    
-    # Use CLIP embeddings for conditioning
-    labels = clip_embeddings
-    
-    # Denoising loop
-    for step in range(steps):
-        # Forward pass to get velocity
-        with torch.no_grad():
-            v = model(x, t, dt_base, labels)
-        
-        # Update x using Euler method
-        x = x + v * d
-        
-        # Update time
-        t = t + d
-    
-    return x
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -203,11 +100,6 @@ def main():
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
-    
-    # Create CLIP embedder
-    clip_processor, clip_model = create_clip_embedder()
-    clip_model.to(device)
-    logger.info("Created CLIP embedder")
     
     # Create dataloaders
     train_dataloader, val_dataloader = create_dataloaders(
@@ -252,10 +144,9 @@ def main():
         mlp_ratio=args.mlp_ratio,
         out_channels=image_channels,
         class_dropout_prob=0.1,  # Not used in our case but keep as in original
-        num_classes=1,  # Will be replaced by CLIP embeddings
+        num_classes=1,  # Unconditional
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     model.to(device)
     
@@ -277,8 +168,7 @@ def main():
         class_dropout_prob=0.1,
         num_classes=1,
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     ema_model.to(device)
     # Initialize EMA model with model weights
@@ -329,19 +219,13 @@ def main():
                 
             x_lr, x_hr = x_lr.to(device), x_hr.to(device)
             
-            # Get CLIP embeddings from original low-res images before VAE encoding
-            clip_embeddings = get_clip_embeddings(x_lr, clip_processor, clip_model, device)
-            
-            # Store original batch size for later
-            original_batch_size = x_lr.shape[0]
-            
             if vae is not None:
                 with torch.no_grad():
                     x_hr = vae.encode(x_hr)
                     x_lr = vae.encode(x_lr)
             
             # Get targets
-            x_t, v_t, t, dt_base, _, info = get_targets(
+            x_t, v_t, t, dt_base, labels, info = get_targets(
                 batch_size=args.batch_size,
                 x_1=x_hr,
                 x_0=x_lr,
@@ -357,18 +241,8 @@ def main():
                 device=device
             )
             
-            # Adjust CLIP embeddings to match the targets
-            # The bootstrap process in get_targets may have changed the batch arrangement
-            bst_size = args.batch_size // args.bootstrap_every
-            bst_size_data = args.batch_size - bst_size
-            
-            # Create combined CLIP embeddings that match the structure of x_t
-            bootstrap_embeddings = clip_embeddings[:bst_size]
-            flow_embeddings = clip_embeddings[bst_size:original_batch_size][:bst_size_data]
-            combined_clip_embeddings = torch.cat([bootstrap_embeddings, flow_embeddings], dim=0)
-            
-            # Forward pass with CLIP embeddings
-            v_pred = model(x_t, t, dt_base, combined_clip_embeddings)
+            # Forward pass
+            v_pred = model(x_t, t, dt_base, labels)
             
             # Compute loss
             mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
@@ -430,9 +304,6 @@ def main():
                     for x_lr_val, x_hr_val in val_dataloader:
                         x_lr_val, x_hr_val = x_lr_val.to(device), x_hr_val.to(device)
                         
-                        # Get CLIP embeddings for validation images
-                        clip_embeddings_val = get_clip_embeddings(x_lr_val, clip_processor, clip_model, device)
-                        
                         if vae is not None:
                             x_hr_val = vae.encode(x_hr_val)
                             x_lr_val = vae.encode(x_lr_val)
@@ -451,8 +322,11 @@ def main():
                         # Default to flow-matching dt
                         dt_base_val = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
                         
-                        # Forward pass with CLIP embeddings
-                        v_pred_val = model(x_t_val, t_val, dt_base_val, clip_embeddings_val)
+                        # Zero labels for unconditional
+                        labels_val = torch.zeros(batch_size, dtype=torch.long, device=device)
+                        
+                        # Forward pass
+                        v_pred_val = model(x_t_val, t_val, dt_base_val, labels_val)
                         
                         # Compute loss
                         mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
@@ -471,13 +345,11 @@ def main():
                 with torch.no_grad():
                     # Choose a fixed low-res image for visualization
                     x_lr_sample = x_lr_val[:8].clone()
-                    clip_embeddings_sample = clip_embeddings_val[:8].clone()
                     
                     # Generate one-step sample
                     one_step_images = generate_sample(
                         model=ema_model,
                         x_0=x_lr_sample,
-                        clip_embeddings=clip_embeddings_sample,
                         steps=1,
                         device=device
                     )
@@ -486,7 +358,6 @@ def main():
                     multi_step_images = generate_sample(
                         model=ema_model,
                         x_0=x_lr_sample,
-                        clip_embeddings=clip_embeddings_sample,
                         steps=8,
                         device=device
                     )
@@ -562,6 +433,53 @@ def main():
     )
     
     logger.info("Training completed!")
+
+def generate_sample(model, x_0, steps=1, device=None):
+    """
+    Generate sample using the shortcut model.
+    
+    Args:
+        model: Shortcut model
+        x_0: Low-resolution input [B, H, W, C]
+        steps: Number of denoising steps
+        device: Device to use
+        
+    Returns:
+        Generated high-resolution image [B, H, W, C]
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    
+    batch_size = x_0.shape[0]
+    
+    # Start from low-resolution image
+    x = x_0.clone()
+    
+    # Calculate step size
+    d = 1.0 / steps
+    
+    # Initialize current time
+    t = torch.zeros(batch_size, device=device)
+    
+    # For timestep conditioning
+    dt_base = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(steps))
+    
+    # Zero labels for unconditional
+    labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+    
+    # Denoising loop
+    for step in range(steps):
+        # Forward pass to get velocity
+        with torch.no_grad():
+            v = model(x, t, dt_base, labels)
+        
+        # Update x using Euler method
+        x = x + v * d
+        
+        # Update time
+        t = t + d
+    
+    return x
 
 if __name__ == '__main__':
     main()

@@ -7,8 +7,6 @@ from tqdm import tqdm
 import torchvision.transforms as transforms
 from torchvision.utils import save_image
 import glob
-from transformers import CLIPProcessor, CLIPVisionModel
-import torch.nn.functional as F
 
 from model import DiT
 from vae import StableVAE
@@ -29,60 +27,6 @@ def parse_args():
     parser.add_argument('--use_ema', action='store_true', help='Use EMA model weights')
     
     return parser.parse_args()
-
-def create_clip_embedder():
-    """Create a CLIP vision model for image embeddings"""
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-    model.eval()  # Set to evaluation mode
-    
-    # Freeze the model parameters
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    return processor, model
-
-def get_clip_embeddings(images, processor, clip_model, device):
-    """
-    Get CLIP embeddings for images
-    
-    Args:
-        images: Images tensor in range [-1, 1], shape [B, H, W, C]
-        processor: CLIP processor
-        clip_model: CLIP vision model
-        device: Device to use
-        
-    Returns:
-        Embeddings tensor, shape [B, 768]
-    """
-    # Convert from [-1, 1] to [0, 1] range
-    images = (images + 1) / 2
-    
-    # Convert to correct format for CLIP
-    images = images.permute(0, 3, 1, 2)  # [B, C, H, W]
-    images = images * 255
-    
-    # Convert to PIL images for the processor
-    processed_images = []
-    for img in images:
-        # Ensure we have 3 channels (RGB)
-        if img.shape[0] == 4:  # If 4 channels, take first 3
-            img = img[:3]
-        
-        # Resize to CLIP expected size
-        img = F.interpolate(img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-        processed_images.append(img.cpu())
-    
-    # Process images with CLIP processor
-    pixel_values = processor(images=processed_images, return_tensors="pt").pixel_values
-    pixel_values = pixel_values.to(device)
-    
-    # Get embeddings from CLIP model
-    with torch.no_grad():
-        outputs = clip_model(pixel_values)
-        embeddings = outputs.pooler_output  # [B, 768]
-    
-    return embeddings
 
 def load_model(config, checkpoint_path, device, use_ema=False):
     """
@@ -106,10 +50,9 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         mlp_ratio=config['mlp_ratio'],
         out_channels=config.get('image_channels', 4 if config.get('use_stable_vae', False) else 3),
         class_dropout_prob=0.1,  # Not used but keep as in original
-        num_classes=1,  # We'll use CLIP embeddings instead
+        num_classes=1,  # Unconditional
         dropout=config.get('dropout', 0.0),
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     
     try:
@@ -184,14 +127,13 @@ def prepare_image(image_path, image_size, low_res_factor):
     
     return low_res, high_res
 
-def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
+def generate_sample(model, x_0, steps=1, device=None):
     """
     Generate sample using the shortcut model.
     
     Args:
         model: Shortcut model
         x_0: Low-resolution input [B, H, W, C]
-        clip_embeddings: CLIP embeddings for conditioning [B, 768]
         steps: Number of denoising steps
         device: Device to use
         
@@ -215,8 +157,8 @@ def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
     # For timestep conditioning
     dt_base = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(steps))
     
-    # Use CLIP embeddings for conditioning
-    labels = clip_embeddings
+    # Zero labels for unconditional
+    labels = torch.zeros(batch_size, dtype=torch.long, device=device)
     
     # Denoising loop
     for step in range(steps):
@@ -244,11 +186,6 @@ def main():
     
     # Load config
     config = load_json(args.config_path)
-    
-    # Create CLIP embedder
-    clip_processor, clip_model = create_clip_embedder()
-    clip_model.to(device)
-    print("Created CLIP embedder")
     
     # Load model
     model = load_model(config, args.model_path, device, args.use_ema)
@@ -290,32 +227,19 @@ def main():
         # Concatenate batch
         batch_low_res = torch.cat(batch_low_res, dim=0).to(device)
         
-        # Get CLIP embeddings from original low-res images before VAE encoding
-        clip_embeddings = get_clip_embeddings(batch_low_res, clip_processor, clip_model, device)
-        
         # Encode with VAE if needed
         if vae is not None:
             with torch.no_grad():
-                batch_low_res_vae = vae.encode(batch_low_res)
-        else:
-            batch_low_res_vae = batch_low_res
+                batch_low_res = vae.encode(batch_low_res)
         
         # Generate high-resolution samples
-        batch_high_res = generate_sample(
-            model, 
-            batch_low_res_vae, 
-            clip_embeddings, 
-            steps=args.steps, 
-            device=device
-        )
+        batch_high_res = generate_sample(model, batch_low_res, steps=args.steps, device=device)
         
         # Decode with VAE if needed
         if vae is not None:
             with torch.no_grad():
-                batch_low_res_out = vae.decode(batch_low_res_vae)
+                batch_low_res = vae.decode(batch_low_res)
                 batch_high_res = vae.decode(batch_high_res)
-        else:
-            batch_low_res_out = batch_low_res
         
         # Save images
         for j in range(batch_size):
@@ -335,7 +259,7 @@ def main():
             
             # For comparison, also save the low-res input
             low_res_output_path = os.path.join(args.output_dir, f"{os.path.splitext(original_names[j])[0]}_lr.png")
-            low_res_img = batch_low_res_out[j].permute(2, 0, 1)
+            low_res_img = batch_low_res[j].permute(2, 0, 1)
             save_image(
                 low_res_img,
                 low_res_output_path,
