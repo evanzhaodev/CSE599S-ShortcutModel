@@ -254,8 +254,7 @@ def main():
         class_dropout_prob=0.1,  # Not used in our case but keep as in original
         num_classes=1,  # Will be replaced by CLIP embeddings
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     model.to(device)
     
@@ -277,8 +276,7 @@ def main():
         class_dropout_prob=0.1,
         num_classes=1,
         dropout=args.dropout,
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     ema_model.to(device)
     # Initialize EMA model with model weights
