@@ -387,7 +387,6 @@ class DiT(nn.Module):
         self.num_classes = num_classes
         self.ignore_dt = ignore_dt
         self.dropout = dropout
-        self.is_image = is_image
         self.dtype = dtype
         
         # Create training config
