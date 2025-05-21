@@ -60,7 +60,7 @@ def get_clip_embeddings(images, processor, clip_model, device):
     
     # Convert to correct format for CLIP
     images = images.permute(0, 3, 1, 2)  # [B, C, H, W]
-    # Don't scale to [0, 255] - keep in [0, 1] range for the processor
+    images = images * 255
     
     # Convert to PIL images for the processor
     processed_images = []
@@ -71,10 +71,10 @@ def get_clip_embeddings(images, processor, clip_model, device):
         
         # Resize to CLIP expected size
         img = F.interpolate(img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-        processed_images.append(img.to(device))
+        processed_images.append(img.cpu())
     
-    # Process images with CLIP processor - passing tensors in [0, 1] range
-    pixel_values = processor(images=processed_images, return_tensors="pt", do_rescale=False).pixel_values
+    # Process images with CLIP processor
+    pixel_values = processor(images=processed_images, return_tensors="pt").pixel_values
     pixel_values = pixel_values.to(device)
     
     # Get embeddings from CLIP model
