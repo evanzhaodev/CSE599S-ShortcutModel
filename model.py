@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
+    # Original JAX code: x * (1 + scale[:, None]) + shift[:, None]
+    # scale = torch.clamp(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -380,9 +382,10 @@ class DiT(nn.Module):
         # If using low-res conditioning, add separate patch embedding for it
         if self.use_low_res_cond:
             self.low_res_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
-            # Low-res conditionining projection
-            self.low_res_proj = nn.Linear(hidden_size, hidden_size)
-            self.tc.kern_init()(self.low_res_proj)
+            
+            # Concatenation projection
+            self.concat_proj = nn.Linear(hidden_size * 2, hidden_size)
+            self.tc.kern_init()(self.concat_proj)
         
         # Time, dt, and label embedders
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
@@ -420,12 +423,12 @@ class DiT(nn.Module):
         pos_embed = pos_embed.to(self.dtype)
         
         # Patch embedding of the noise/target state
-        x = self.patch_embed(x)  # (B, num_patches, hidden_size)
-        activations['patch_embed'] = x
+        x_embed = self.patch_embed(x)  # (B, num_patches, hidden_size)
+        activations['patch_embed'] = x_embed
         
-        # Add positional embedding
-        x = x + pos_embed
-        x = x.to(self.dtype)
+        # Add positional embedding to noise embedding
+        x_embed = x_embed + pos_embed
+        x_embed = x_embed.to(self.dtype)
         
         # Process low-res conditioning if provided
         if self.use_low_res_cond and low_res is not None:
@@ -433,11 +436,14 @@ class DiT(nn.Module):
             low_res_embed = self.low_res_embed(low_res)
             low_res_embed = low_res_embed + pos_embed  # Add same positional embedding
             low_res_embed = low_res_embed.to(self.dtype)
-            
-            # Project and add to input embedding
-            low_res_embed = self.low_res_proj(low_res_embed)
-            x = x + low_res_embed
             activations['low_res_embed'] = low_res_embed
+            
+            # Concatenate embeddings and project
+            x = torch.cat([x_embed, low_res_embed], dim=-1)
+            x = self.concat_proj(x)
+            activations['concat_proj'] = x
+        else:
+            x = x_embed
         
         # Time, dt, and label embeddings
         te = self.timestep_embedder(t)  # (B, hidden_size)
