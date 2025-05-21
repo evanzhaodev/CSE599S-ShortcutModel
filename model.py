@@ -5,8 +5,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
-    # Original JAX code: x * (1 + scale[:, None]) + shift[:, None]
-    # scale = torch.clamp(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -354,6 +352,7 @@ class DiT(nn.Module):
         out_channels,
         class_dropout_prob,
         num_classes,
+        use_low_res_cond=True,  # Add parameter for low-res conditioning
         ignore_dt=False,
         dropout=0.0,
         dtype=torch.float32
@@ -367,6 +366,7 @@ class DiT(nn.Module):
         self.out_channels = out_channels
         self.class_dropout_prob = class_dropout_prob
         self.num_classes = num_classes
+        self.use_low_res_cond = use_low_res_cond  # Store the conditioning flag
         self.ignore_dt = ignore_dt
         self.dropout = dropout
         self.dtype = dtype
@@ -374,8 +374,15 @@ class DiT(nn.Module):
         # Create training config
         self.tc = TrainConfig(dtype=dtype)
         
-        # Patch embedding
+        # Patch embedding for noise/target input
         self.patch_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
+        
+        # If using low-res conditioning, add separate patch embedding for it
+        if self.use_low_res_cond:
+            self.low_res_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
+            # Low-res conditionining projection
+            self.low_res_proj = nn.Linear(hidden_size, hidden_size)
+            self.tc.kern_init()(self.low_res_proj)
         
         # Time, dt, and label embedders
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
@@ -395,9 +402,8 @@ class DiT(nn.Module):
         self.logvar_embed = nn.Embedding(256, 1)
         nn.init.zeros_(self.logvar_embed.weight)
         
-    def forward(self, x, t, dt, y, train=False, return_activations=False):
-        # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
-        # print(f"DiT: Input of shape {x.shape} dtype {x.dtype}")
+    def forward(self, x, low_res=None, t=None, dt=None, y=None, train=False, return_activations=False, cfg_scale=0.0):
+        # x = (B, H, W, C) noise state, low_res = (B, H, W, C) low-res conditioning, t = (B,) timesteps, y = (B,) class labels
         activations = {}
         
         batch_size = x.shape[0]
@@ -413,43 +419,105 @@ class DiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, num_patches, device=x.device)
         pos_embed = pos_embed.to(self.dtype)
         
-        # Patch embedding
+        # Patch embedding of the noise/target state
         x = self.patch_embed(x)  # (B, num_patches, hidden_size)
-        # print(f"DiT: After patch embed, shape is {x.shape} dtype {x.dtype}")
         activations['patch_embed'] = x
         
         # Add positional embedding
         x = x + pos_embed
         x = x.to(self.dtype)
         
+        # Process low-res conditioning if provided
+        if self.use_low_res_cond and low_res is not None:
+            # Embed low-res image
+            low_res_embed = self.low_res_embed(low_res)
+            low_res_embed = low_res_embed + pos_embed  # Add same positional embedding
+            low_res_embed = low_res_embed.to(self.dtype)
+            
+            # Project and add to input embedding
+            low_res_embed = self.low_res_proj(low_res_embed)
+            x = x + low_res_embed
+            activations['low_res_embed'] = low_res_embed
+        
         # Time, dt, and label embeddings
         te = self.timestep_embedder(t)  # (B, hidden_size)
         dte = self.dt_embedder(dt)  # (B, hidden_size)
-        ye = self.label_embedder(y)  # (B, hidden_size)
-        c = te + ye + dte
         
-        # Store activations
-        activations['pos_embed'] = pos_embed
-        activations['time_embed'] = te
-        activations['dt_embed'] = dte
-        activations['label_embed'] = ye
-        activations['conditioning'] = c
-        
-        # print(f"DiT: Patch Embed of shape {x.shape} dtype {x.dtype}")
-        # print(f"DiT: Conditioning of shape {c.shape} dtype {c.dtype}")
-        
-        # Apply transformer blocks
-        for i in range(self.depth):
-            x = self.blocks[i](x, c, train=train)
-            activations[f'dit_block_{i}'] = x
+        # Handle classifier-free guidance
+        if cfg_scale > 0 and y is not None:
+            # For classifier-free guidance, we need two forward passes:
+            # 1. With the labels (conditional)
+            # 2. With null labels (unconditional)
             
-        # Apply final layer
-        x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
-        activations['final_layer'] = x
+            # Save half of original batch as conditional samples
+            x_cond = x[:batch_size//2].clone()
+            t_cond = t[:batch_size//2].clone()
+            dt_cond = dt[:batch_size//2].clone()
+            y_cond = y[:batch_size//2].clone()
+            
+            # Get label embeddings for conditional path
+            ye_cond = self.label_embedder(y_cond)
+            c_cond = te[:batch_size//2] + ye_cond + dte[:batch_size//2]
+            
+            # Create a null label embedding for the unconditional path
+            null_labels = torch.zeros_like(y_cond)
+            ye_uncond = self.label_embedder(null_labels)
+            c_uncond = te[:batch_size//2] + ye_uncond + dte[:batch_size//2]
+            
+            # Process conditional path
+            x_cond_out = x_cond.clone()
+            for i in range(self.depth):
+                x_cond_out = self.blocks[i](x_cond_out, c_cond, train=train)
+            
+            # Process unconditional path
+            x_uncond_out = x_cond.clone()  # Use same input but different conditioning
+            for i in range(self.depth):
+                x_uncond_out = self.blocks[i](x_uncond_out, c_uncond, train=train)
+            
+            # Apply final layer to both paths
+            x_cond_out = self.final_layer(x_cond_out, c_cond)
+            x_uncond_out = self.final_layer(x_uncond_out, c_uncond)
+            
+            # Apply classifier-free guidance combining the two outputs
+            guided_output = x_uncond_out + cfg_scale * (x_cond_out - x_uncond_out)
+            
+            # Only process the second half of the batch normally (for training)
+            if batch_size > batch_size//2:
+                ye = self.label_embedder(y[batch_size//2:])
+                c = te[batch_size//2:] + ye + dte[batch_size//2:]
+                
+                # Process remaining samples normally
+                x_remain = x[batch_size//2:]
+                for i in range(self.depth):
+                    x_remain = self.blocks[i](x_remain, c, train=train)
+                x_remain = self.final_layer(x_remain, c)
+                
+                # Combine outputs
+                x = torch.cat([guided_output, x_remain], dim=0)
+            else:
+                x = guided_output
+        else:
+            # Standard processing without CFG
+            ye = self.label_embedder(y)
+            c = te + ye + dte
+            
+            activations['time_embed'] = te
+            activations['dt_embed'] = dte
+            activations['label_embed'] = ye
+            activations['conditioning'] = c
+            
+            # Apply transformer blocks
+            for i in range(self.depth):
+                x = self.blocks[i](x, c, train=train)
+                activations[f'dit_block_{i}'] = x
+                
+            # Apply final layer
+            x = self.final_layer(x, c)
+            activations['final_layer'] = x
         
         # Reshape output
         x = x.reshape(batch_size, num_patches_side, num_patches_side, 
-                      self.patch_size, self.patch_size, self.out_channels)
+                    self.patch_size, self.patch_size, self.out_channels)
         x = torch.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C', H=int(num_patches_side), W=int(num_patches_side))
         assert x.shape == (batch_size, input_size, input_size, self.out_channels)

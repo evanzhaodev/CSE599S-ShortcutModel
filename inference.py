@@ -25,6 +25,7 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument('--steps', type=int, default=1, help='Number of denoising steps')
     parser.add_argument('--use_ema', action='store_true', help='Use EMA model weights')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale')
     
     return parser.parse_args()
 
@@ -52,6 +53,7 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         class_dropout_prob=0.1,  # Not used but keep as in original
         num_classes=1,  # Unconditional
         dropout=config.get('dropout', 0.0),
+        use_low_res_cond=True,  # Enable low-res conditioning
         ignore_dt=False
     )
     
@@ -127,15 +129,16 @@ def prepare_image(image_path, image_size, low_res_factor):
     
     return low_res, high_res
 
-def generate_sample(model, x_0, steps=1, device=None):
+def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
     """
     Generate sample using the shortcut model.
     
     Args:
         model: Shortcut model
-        x_0: Low-resolution input [B, H, W, C]
+        x_low_res: Low-resolution conditioning input [B, H, W, C]
         steps: Number of denoising steps
         device: Device to use
+        cfg_scale: Classifier-free guidance scale
         
     Returns:
         Generated high-resolution image [B, H, W, C]
@@ -143,10 +146,10 @@ def generate_sample(model, x_0, steps=1, device=None):
     if device is None:
         device = next(model.parameters()).device
     
-    batch_size = x_0.shape[0]
+    batch_size = x_low_res.shape[0]
     
-    # Start from low-resolution image
-    x = x_0.clone()
+    # Start from pure noise
+    x = torch.randn_like(x_low_res, device=device)
     
     # Calculate step size
     d = 1.0 / steps
@@ -162,9 +165,21 @@ def generate_sample(model, x_0, steps=1, device=None):
     
     # Denoising loop
     for step in range(steps):
-        # Forward pass to get velocity
+        # Forward pass to get velocity with low-res conditioning
         with torch.no_grad():
-            v = model(x, t, dt_base, labels)
+            # If using CFG, we need to do two forward passes
+            if cfg_scale > 0:
+                # Conditional pass
+                v_cond = model(x, x_low_res, t, dt_base, labels)
+                
+                # Unconditional pass (using null labels or special technique for unconditional generation)
+                # Here we use the same inputs but with null labels
+                v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                
+                # Apply classifier-free guidance
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v = model(x, x_low_res, t, dt_base, labels)
         
         # Update x using Euler method
         x = x + v * d
@@ -232,8 +247,14 @@ def main():
             with torch.no_grad():
                 batch_low_res = vae.encode(batch_low_res)
         
-        # Generate high-resolution samples
-        batch_high_res = generate_sample(model, batch_low_res, steps=args.steps, device=device)
+        # Generate high-resolution samples from noise conditioned on low-res
+        batch_high_res = generate_sample(
+            model=model,
+            x_low_res=batch_low_res, 
+            steps=args.steps,
+            device=device,
+            cfg_scale=args.cfg_scale
+        )
         
         # Decode with VAE if needed
         if vae is not None:

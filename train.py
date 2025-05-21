@@ -67,6 +67,8 @@ def parse_args():
     parser.add_argument('--bootstrap_every', type=int, default=8, help='Bootstrap every N samples')
     parser.add_argument('--bootstrap_ema', type=int, default=1, help='Use EMA for bootstrap')
     parser.add_argument('--bootstrap_dt_bias', type=int, default=0, help='Bias for dt sampling')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale')
+    parser.add_argument('--bootstrap_cfg', type=float, default=0.0, help='CFG scale for bootstrap')
     
     # Checkpoint arguments
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
@@ -144,8 +146,9 @@ def main():
         mlp_ratio=args.mlp_ratio,
         out_channels=image_channels,
         class_dropout_prob=0.1,  # Not used in our case but keep as in original
-        num_classes=1,  # Unconditional
+        num_classes=1,  # Unconditional (or could be num_classes for class-conditional)
         dropout=args.dropout,
+        use_low_res_cond=True,  # Enable low-res conditioning
         ignore_dt=False
     )
     model.to(device)
@@ -168,6 +171,7 @@ def main():
         class_dropout_prob=0.1,
         num_classes=1,
         dropout=args.dropout,
+        use_low_res_cond=True,  # Enable low-res conditioning
         ignore_dt=False
     )
     ema_model.to(device)
@@ -224,25 +228,25 @@ def main():
                     x_hr = vae.encode(x_hr)
                     x_lr = vae.encode(x_lr)
             
-            # Get targets
-            x_t, v_t, t, dt_base, labels, info = get_targets(
+            # Get targets for shortcut model (implements the noise-to-data flow with shortcuts)
+            x_t, v_t, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
                 batch_size=args.batch_size,
-                x_1=x_hr,
-                x_0=x_lr,
+                x_1=x_hr,  # Target high-res images
+                x_0=x_lr,  # Low-res conditioning
                 model=ema_model if global_step > 0 else None,
                 use_ema=args.bootstrap_ema,
                 bootstrap_every=args.bootstrap_every,
                 bootstrap_ema=args.bootstrap_ema,
-                bootstrap_cfg=0,  # No classifier-free guidance for super-resolution
+                bootstrap_cfg=args.bootstrap_cfg,  # Enable CFG for bootstrap
                 bootstrap_dt_bias=args.bootstrap_dt_bias,
                 denoise_timesteps=args.denoise_timesteps,
-                cfg_scale=0.0,
-                num_classes=1,
+                cfg_scale=args.cfg_scale,  # CFG scale
+                num_classes=1,  # Unconditional for now
                 device=device
             )
             
-            # Forward pass
-            v_pred = model(x_t, t, dt_base, labels)
+            # Forward pass with conditioning on low-res image
+            v_pred = model(x_t, x_low_res, t, dt_base, labels)
             
             # Compute loss
             mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
@@ -308,25 +312,28 @@ def main():
                             x_hr_val = vae.encode(x_hr_val)
                             x_lr_val = vae.encode(x_lr_val)
                         
+                        # Generate random noise
+                        batch_size_val = x_lr_val.shape[0]
+                        x_noise_val = torch.randn_like(x_hr_val)
+                        
                         # Sample t uniformly
-                        batch_size = x_lr_val.shape[0]
-                        t_val = torch.rand(batch_size, device=device)
+                        t_val = torch.rand(batch_size_val, device=device)
                         t_full_val = t_val.view(-1, 1, 1, 1)
                         
-                        # Interpolate between low-res and high-res
-                        x_t_val = (1 - (1 - 1e-5) * t_full_val) * x_lr_val + t_full_val * x_hr_val
+                        # Interpolate between noise and high-res (not low-res to high-res)
+                        x_t_val = (1 - t_full_val) * x_noise_val + t_full_val * x_hr_val
                         
-                        # Compute target velocity
-                        v_t_val = x_hr_val - (1 - 1e-5) * x_lr_val
+                        # Compute target velocity (from noise to high-res)
+                        v_t_val = x_hr_val - x_noise_val
                         
                         # Default to flow-matching dt
-                        dt_base_val = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
+                        dt_base_val = torch.ones(batch_size_val, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
                         
                         # Zero labels for unconditional
-                        labels_val = torch.zeros(batch_size, dtype=torch.long, device=device)
+                        labels_val = torch.zeros(batch_size_val, dtype=torch.long, device=device)
                         
-                        # Forward pass
-                        v_pred_val = model(x_t_val, t_val, dt_base_val, labels_val)
+                        # Forward pass with low-res conditioning
+                        v_pred_val = model(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
                         
                         # Compute loss
                         mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
@@ -349,17 +356,19 @@ def main():
                     # Generate one-step sample
                     one_step_images = generate_sample(
                         model=ema_model,
-                        x_0=x_lr_sample,
+                        x_low_res=x_lr_sample,
                         steps=1,
-                        device=device
+                        device=device,
+                        cfg_scale=args.cfg_scale
                     )
                     
                     # Generate multi-step sample (e.g., 8 steps)
                     multi_step_images = generate_sample(
                         model=ema_model,
-                        x_0=x_lr_sample,
+                        x_low_res=x_lr_sample,
                         steps=8,
-                        device=device
+                        device=device,
+                        cfg_scale=args.cfg_scale
                     )
                     
                     # Decode if using VAE
@@ -434,15 +443,16 @@ def main():
     
     logger.info("Training completed!")
 
-def generate_sample(model, x_0, steps=1, device=None):
+def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
     """
     Generate sample using the shortcut model.
     
     Args:
         model: Shortcut model
-        x_0: Low-resolution input [B, H, W, C]
+        x_low_res: Low-resolution conditioning input [B, H, W, C]
         steps: Number of denoising steps
         device: Device to use
+        cfg_scale: Classifier-free guidance scale
         
     Returns:
         Generated high-resolution image [B, H, W, C]
@@ -450,10 +460,10 @@ def generate_sample(model, x_0, steps=1, device=None):
     if device is None:
         device = next(model.parameters()).device
     
-    batch_size = x_0.shape[0]
+    batch_size = x_low_res.shape[0]
     
-    # Start from low-resolution image
-    x = x_0.clone()
+    # Start from pure noise
+    x = torch.randn_like(x_low_res, device=device)
     
     # Calculate step size
     d = 1.0 / steps
@@ -469,9 +479,21 @@ def generate_sample(model, x_0, steps=1, device=None):
     
     # Denoising loop
     for step in range(steps):
-        # Forward pass to get velocity
+        # Forward pass to get velocity with low-res conditioning
         with torch.no_grad():
-            v = model(x, t, dt_base, labels)
+            # If using CFG, we need to do two forward passes
+            if cfg_scale > 0:
+                # Conditional pass
+                v_cond = model(x, x_low_res, t, dt_base, labels)
+                
+                # Unconditional pass (using null labels or special technique for unconditional generation)
+                # Here we use the same inputs but with null labels
+                v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                
+                # Apply classifier-free guidance
+                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v = model(x, x_low_res, t, dt_base, labels)
         
         # Update x using Euler method
         x = x + v * d
