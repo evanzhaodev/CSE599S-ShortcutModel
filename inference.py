@@ -108,8 +108,7 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         class_dropout_prob=0.1,  # Not used but keep as in original
         num_classes=1,  # We'll use CLIP embeddings instead
         dropout=config.get('dropout', 0.0),
-        ignore_dt=False,
-        is_image=False  # We're using CLIP embeddings instead of images for conditioning
+        ignore_dt=False
     )
     
     try:
