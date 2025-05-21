@@ -255,7 +255,7 @@ def main():
         num_classes=1,  # Will be replaced by CLIP embeddings
         dropout=args.dropout,
         ignore_dt=False,
-        is_image=True
+        is_image=False  # We're using CLIP embeddings instead of images for conditioning
     )
     model.to(device)
     
@@ -278,7 +278,7 @@ def main():
         num_classes=1,
         dropout=args.dropout,
         ignore_dt=False,
-        is_image=True
+        is_image=False  # We're using CLIP embeddings instead of images for conditioning
     )
     ema_model.to(device)
     # Initialize EMA model with model weights
