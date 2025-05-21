@@ -445,7 +445,7 @@ class DiT(nn.Module):
         # Time, dt, and label embeddings
         te = self.timestep_embedder(t)  # (B, hidden_size)
         dte = self.dt_embedder(dt)  # (B, hidden_size)
-        if self.is_image and (y.dtype == torch.float32 or y.dtype == torch.float16):
+        if self.is_image:
             ye = self.clip_embedder(y)  # (B, hidden_size)
         else:
             ye = self.label_embedder(y)  # (B, hidden_size)
