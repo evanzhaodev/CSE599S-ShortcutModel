@@ -171,8 +171,8 @@ class MlpBlock(nn.Module):
         self.dropout_rate = dropout_rate
         
         # Pre-initialize the layers with default sizes to match the saved state dict
-        self.fc1 = nn.Linear(768, mlp_dim)  # Default hidden size is typically 768
-        self.fc2 = nn.Linear(mlp_dim, 768)  # Default output is same as input
+        self.fc1 = nn.Linear(1152, mlp_dim)  # Default hidden size is typically 1152
+        self.fc2 = nn.Linear(mlp_dim, 1152)  # Default output is same as input
         
         # Initialize weights
         self.tc.kern_init()(self.fc1)
