@@ -48,11 +48,11 @@ def load_checkpoint(model, optimizer, scheduler, filename, device):
     """Load model checkpoint."""
     try:
         # First try loading with weights_only=True (safer)
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(filename, map_location=device)
     except Exception as e:
         print(f"Warning: Could not load checkpoint with weights_only=True. Trying with weights_only=False: {e}")
         # Fall back to weights_only=False if needed
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(filename, map_location=device, weights_only=False)
     
     model.load_state_dict(checkpoint['model'])
     
