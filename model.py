@@ -65,6 +65,21 @@ class TrainConfig:
                 if hasattr(module, 'bias') and module.bias is not None:
                     nn.init.zeros_(module.bias)
         return init_func
+    
+class VelocityEmbedder(nn.Module):
+    """
+    Embeds Velocity at time t in vector representaion for second order model
+    """
+    def __init__(self,hidden_size):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, 768),
+            nn.ReLU(),
+            nn.Linear(768, hidden_size)
+        )
+    def forward(self, x): 
+        # X : (B, 1)
+        return self.mlp(x)
 
 class TimestepEmbedder(nn.Module):
     """
@@ -374,6 +389,7 @@ class DiT(nn.Module):
         ignore_dt=False,
         dropout=0.0,
         is_image=False,
+        second_order=False,
         dtype=torch.float32
     ):
         super().__init__()
@@ -401,6 +417,8 @@ class DiT(nn.Module):
         self.dt_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.label_embedder = LabelEmbedder(num_classes, hidden_size, tc=self.tc)
         self.clip_embedder = CLIPEmbedder(hidden_size, tc=self.tc)
+        if (second_order):
+            self.velocity_embedder = VelocityEmbedder(hidden_size)
         
         # DiT blocks
         self.blocks = nn.ModuleList([
@@ -415,7 +433,7 @@ class DiT(nn.Module):
         self.logvar_embed = nn.Embedding(256, 1)
         nn.init.zeros_(self.logvar_embed.weight)
         
-    def forward(self, x, t, dt, y, train=False, return_activations=False):
+    def forward(self, x, t, dt, y, vt=None, train=False, return_activations=False):
         # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
         # print(f"DiT: Input of shape {x.shape} dtype {x.dtype}")
         activations = {}
@@ -450,6 +468,9 @@ class DiT(nn.Module):
         else:
             ye = self.label_embedder(y)  # (B, hidden_size)
         c = te + ye + dte
+        if (self.velocity_embedder):
+            ve = self.velocity_embedder(vt)# (B, hidden_size)
+            c += ve
         
         # Store activations
         activations['pos_embed'] = pos_embed
