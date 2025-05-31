@@ -16,7 +16,7 @@ from transformers import CLIPProcessor, CLIPVisionModel
 
 from model import DiT
 from dataset import create_dataloaders
-from targets import get_targets
+from targets import get_targets, get_targets_second_order
 from vae import StableVAE
 from utils import (
     setup_logger, 
@@ -285,6 +285,26 @@ def main():
     for param, ema_param in zip(model.parameters(), ema_model.parameters()):
         ema_param.data.copy_(param.data)
     ema_model.eval()
+
+    ema_model_scnd_order = DiT(
+        patch_size=args.patch_size,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        out_channels=image_channels,
+        class_dropout_prob=0.1,
+        num_classes=1,
+        dropout=args.dropout,
+        ignore_dt=False,
+        is_image=True,
+        second_order=True,
+    )
+    ema_model_scnd_order.to(device)
+    # Initialize EMA model with model weights
+    for param, ema_param in zip(model.parameters(), ema_model_scnd_order.parameters()):
+        ema_param.data.copy_(param.data)
+    ema_model_scnd_order.eval()
     
     # Create learning rate scheduler
     if args.use_cosine:
@@ -341,11 +361,12 @@ def main():
                     x_lr = vae.encode(x_lr)
             
             # Get targets
-            x_t, v_t, t, dt_base, _, info = get_targets(
+            x_t, v_t, t, dt_base, _, info = get_targets_second_order(
                 batch_size=args.batch_size,
                 x_1=x_hr,
                 x_0=x_lr,
-                model=ema_model if global_step > 0 else None,
+                vmodel=ema_model if global_step > 0 else None,
+                amodel= ema_model_scnd_order,
                 use_ema=args.bootstrap_ema,
                 bootstrap_every=args.bootstrap_every,
                 bootstrap_ema=args.bootstrap_ema,
@@ -369,10 +390,12 @@ def main():
             
             # Forward pass with CLIP embeddings
             v_pred = model(x_t, t, dt_base, combined_clip_embeddings)
+            a_pred = model(x_t, t, dt_base, combined_clip_embeddings, vt=v_pred)
             
             # Compute loss
             mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
-            loss = torch.mean(mse_v)
+            mse_a = torch.mean((a_pred - v_t) ** 2, dim=(1, 2, 3))
+            loss = torch.mean(mse_v) + torch.mean(mse_a)
             
             # Backward pass
             optimizer.zero_grad()
@@ -394,6 +417,7 @@ def main():
                 
             # Update EMA model
             update_ema(model, ema_model, args.target_update_rate)
+            update_ema(model, ema_model_scnd_order, args.target_update_rate)
             
             # Log
             if global_step % args.log_interval == 0:
@@ -443,20 +467,27 @@ def main():
                         t_full_val = t_val.view(-1, 1, 1, 1)
                         
                         # Interpolate between low-res and high-res
-                        x_t_val = (1 - (1 - 1e-5) * t_full_val) * x_lr_val + t_full_val * x_hr_val
-                        
-                        # Compute target velocity
-                        v_t_val = x_hr_val - (1 - 1e-5) * x_lr_val
+                        # TODO: FINISH THE CODE FROM HERE DOWNWA
+                        x_t_val = np.cos(np.pi/2 * t_full_val) * x_lr_val +\
+                                    np.sin(np.pi/2 * t_full_val) * x_hr_val
+                        v_t_val =  -(np.pi/2)*np.sin(np.pi/2 * t_full_val)*x_lr_val +\
+                                    (np.pi/2)*np.cos(np.pi/2 * t_full_val) * x_hr_val
+                        a_t_val = (-(np.pi/2)**2)*np.cos(np.pi/2 * t_full_val)*x_lr_val -\
+                                    ((np.pi/2)**2)*np.sin(np.pi/2 * t_full_val) * x_hr_val
                         
                         # Default to flow-matching dt
                         dt_base_val = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
                         
                         # Forward pass with CLIP embeddings
                         v_pred_val = model(x_t_val, t_val, dt_base_val, clip_embeddings_val)
+                        a_pred_val = ema_model_scnd_order(x_t_val, t_val, dt_base_val, clip_embeddings_val, vt=v_pred_val)
+
                         
                         # Compute loss
                         mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
-                        val_loss = torch.mean(mse_v_val)
+                        mse_a_val = torch.mean((a_pred_val - a_t_val) ** 2, dim=(1, 2, 3))
+
+                        val_loss = torch.mean(mse_v_val)+torch.mean(mse_a_val)
                         
                         val_losses.append(val_loss.item())
                 
