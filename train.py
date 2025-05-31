@@ -138,12 +138,13 @@ def get_clip_embeddings(images, processor, clip_model, device):
     
     return embeddings
 
-def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
+def generate_sample(model, amodel, x_0, clip_embeddings, steps=1, device=None):
     """
     Generate sample using the shortcut model.
     
     Args:
-        model: Shortcut model
+        model: Shortcut model,
+        amodel: Acceleration model,
         x_0: Low-resolution input [B, H, W, C]
         clip_embeddings: CLIP embeddings for conditioning
         steps: Number of denoising steps
@@ -177,9 +178,10 @@ def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
         # Forward pass to get velocity
         with torch.no_grad():
             v = model(x, t, dt_base, labels)
+            a = amodel(a,t,dt_base, labels, vt=v)
         
         # Update x using Euler method
-        x = x + v * d
+        x = x + v * d + ((d**2)/2)*a
         
         # Update time
         t = t + d
@@ -258,6 +260,22 @@ def main():
         is_image=True
     )
     model.to(device)
+
+    amodel = DiT(
+        patch_size=args.patch_size,
+        hidden_size=args.hidden_size,
+        depth=args.depth,
+        num_heads=args.num_heads,
+        mlp_ratio=args.mlp_ratio,
+        out_channels=image_channels,
+        class_dropout_prob=0.1,  # Not used in our case but keep as in original
+        num_classes=1,  # Will be replaced by CLIP embeddings
+        dropout=args.dropout,
+        ignore_dt=False,
+        second_order=True,
+        is_image=True
+    )
+    amodel.to(device)
     
     # Create optimizer
     optimizer = optim.AdamW(
@@ -302,7 +320,7 @@ def main():
     )
     ema_model_scnd_order.to(device)
     # Initialize EMA model with model weights
-    for param, ema_param in zip(model.parameters(), ema_model_scnd_order.parameters()):
+    for param, ema_param in zip(amodel.parameters(), ema_model_scnd_order.parameters()):
         ema_param.data.copy_(param.data)
     ema_model_scnd_order.eval()
     
@@ -390,7 +408,7 @@ def main():
             
             # Forward pass with CLIP embeddings
             v_pred = model(x_t, t, dt_base, combined_clip_embeddings)
-            a_pred = model(x_t, t, dt_base, combined_clip_embeddings, vt=v_pred)
+            a_pred = amodel(x_t, t, dt_base, combined_clip_embeddings, vt=v_pred)
             
             # Compute loss
             mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
@@ -417,7 +435,7 @@ def main():
                 
             # Update EMA model
             update_ema(model, ema_model, args.target_update_rate)
-            update_ema(model, ema_model_scnd_order, args.target_update_rate)
+            update_ema(amodel, ema_model_scnd_order, args.target_update_rate)
             
             # Log
             if global_step % args.log_interval == 0:
@@ -448,6 +466,7 @@ def main():
             # Evaluation
             if global_step % args.eval_interval == 0:
                 model.eval()
+                amodel.eval()
                 val_losses = []
                 
                 with torch.no_grad():
@@ -480,7 +499,7 @@ def main():
                         
                         # Forward pass with CLIP embeddings
                         v_pred_val = model(x_t_val, t_val, dt_base_val, clip_embeddings_val)
-                        a_pred_val = ema_model_scnd_order(x_t_val, t_val, dt_base_val, clip_embeddings_val, vt=v_pred_val)
+                        a_pred_val = amodel(x_t_val, t_val, dt_base_val, clip_embeddings_val, vt=v_pred_val)
 
                         
                         # Compute loss
@@ -507,6 +526,7 @@ def main():
                     # Generate one-step sample
                     one_step_images = generate_sample(
                         model=ema_model,
+                        amodel=amodel,
                         x_0=x_lr_sample,
                         clip_embeddings=clip_embeddings_sample,
                         steps=1,
@@ -516,6 +536,7 @@ def main():
                     # Generate multi-step sample (e.g., 8 steps)
                     multi_step_images = generate_sample(
                         model=ema_model,
+                        amodel=ema_model_scnd_order,
                         x_0=x_lr_sample,
                         clip_embeddings=clip_embeddings_sample,
                         steps=8,
@@ -569,6 +590,10 @@ def main():
                     ema_model.state_dict(),
                     os.path.join(args.output_dir, f'ema_model_step_{global_step}.pt')
                 )
+                torch.save(
+                    ema_model_scnd_order.state_dict(),
+                    os.path.join(args.output_dir, f'ema_model_second_order_step_{global_step}.pt')
+                )
                 
                 logger.info(f"Saved checkpoint at step {global_step}")
             
@@ -585,11 +610,25 @@ def main():
         metrics={'val_loss': avg_val_loss if 'avg_val_loss' in locals() else 0.0},
         filename=os.path.join(args.output_dir, 'model_final.pt')
     )
+    save_checkpoint(
+        model=amodel,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=epoch,
+        step=global_step,
+        config=vars(args),
+        metrics={'val_loss': avg_val_loss if 'avg_val_loss' in locals() else 0.0},
+        filename=os.path.join(args.output_dir, 'amodel_final.pt')
+    )
     
     # Save final EMA model
     torch.save(
         ema_model.state_dict(),
         os.path.join(args.output_dir, 'ema_model_final.pt')
+    )
+    torch.save(
+        ema_model_scnd_order.state_dict(),
+        os.path.join(args.output_dir, 'ema_model_second_order_final.pt')
     )
     
     logger.info("Training completed!")
