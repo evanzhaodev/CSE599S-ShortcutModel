@@ -286,24 +286,27 @@ def main():
                 )
                 
                 # Forward pass
-                v_pred = model.forward_velocity(x_t, x_low_res, t, dt_base, labels)
-                a_pred = model.forward_acceleration(x_t, v_pred, x_low_res, t, dt_base, labels)
+                v_pred = model.forward_velocity(x_t, x_low_res, t, dt_base, labels, train=True)
+                a_pred = model.forward_acceleration(x_t, v_pred, x_low_res, t, dt_base, labels, train=True)
                 
                 # Self-consistency target for velocity
                 with torch.no_grad():
+                    model.eval()  # Ensure model is in eval mode
                     # Take a small step
                     d = 1.0 / args.denoise_timesteps
-                    x_next = x_t + d * v_pred + (d**2 / 2) * a_pred
+                    t_next = torch.clamp(t + d, 0.0, 1.0)  # Ensure t stays in [0, 1]
+                    x_next = x_t + d * v_pred.detach() + (d**2 / 2) * a_pred.detach()
                     x_next = torch.clamp(x_next, -4, 4)
                     
                     # Get velocity at next step
-                    v_next = model.forward_velocity(x_next, x_low_res, t + d, dt_base, labels)
-                    v_sc_target = (v_pred + v_next) / 2
+                    v_next = model.forward_velocity(x_next, x_low_res, t_next, dt_base, labels, train=False)
+                    v_sc_target = (v_pred.detach() + v_next.detach()) / 2
+                    model.train()  # Set back to train mode
                 
                 # Compute losses
                 loss_v = torch.mean((v_pred - v_t) ** 2)
                 loss_a = torch.mean((a_pred - a_t) ** 2)
-                loss_sc = torch.mean((v_pred - v_sc_target) ** 2)
+                loss_sc = torch.mean((v_pred - v_sc_target.detach()) ** 2)
                 
                 # Total loss with weights
                 loss = args.homo_lambda_v * loss_v + \
@@ -432,8 +435,8 @@ def main():
                         
                         if args.use_homo:
                             # Forward pass
-                            v_pred_val = model.forward_velocity(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
-                            a_pred_val = model.forward_acceleration(x_t_val, v_pred_val, x_lr_val, t_val, dt_base_val, labels_val)
+                            v_pred_val = model.forward_velocity(x_t_val, x_lr_val, t_val, dt_base_val, labels_val, train=False)
+                            a_pred_val = model.forward_acceleration(x_t_val, v_pred_val, x_lr_val, t_val, dt_base_val, labels_val, train=False)
                             
                             # Compute losses
                             loss_v_val = torch.mean((v_pred_val - v_t_val) ** 2)
@@ -603,11 +606,12 @@ def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0, use_h
         with torch.no_grad():
             if use_homo:
                 # Get velocity and acceleration
-                v = model.forward_velocity(x, x_low_res, t, dt_base, labels)
-                a = model.forward_acceleration(x, v, x_low_res, t, dt_base, labels)
+                v = model.forward_velocity(x, x_low_res, t, dt_base, labels, train=False)
+                a = model.forward_acceleration(x, v, x_low_res, t, dt_base, labels, train=False)
                 
                 # Update using second-order integration
                 x = x + v * d + a * (d**2 / 2)
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
             else:
                 # Original first-order update
                 if cfg_scale > 0:
@@ -624,9 +628,10 @@ def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0, use_h
                 
                 # Update x using Euler method
                 x = x + v * d
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
         
         # Update time
-        t = t + d
+        t = torch.clamp(t + d, 0.0, 1.0)
     
     return x
 

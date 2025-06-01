@@ -348,6 +348,9 @@ class DiT(nn.Module):
         # For second-order model, we need to embed the velocity input
         if self.order == 'second':
             self.velocity_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
+            # Use a separate projection for velocity concatenation
+            self.velocity_concat_proj = nn.Linear(hidden_size * 2, hidden_size)
+            self.tc.kern_init()(self.velocity_concat_proj)
         
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.dt_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
@@ -400,7 +403,7 @@ class DiT(nn.Module):
             v_embed = v_embed.to(self.dtype)
             # Concatenate noise and velocity embeddings
             x_embed = torch.cat([x_embed, v_embed], dim=-1)
-            x_embed = self.concat_proj(x_embed)
+            x_embed = self.velocity_concat_proj(x_embed)
         
         # Process low-res conditioning if provided
         if self.use_low_res_cond and low_res is not None:
@@ -480,6 +483,7 @@ class DiT(nn.Module):
         assert x.shape == (batch_size, input_size, input_size, self.out_channels)
         
         t_discrete = torch.floor(t * 256).long()
+        t_discrete = torch.clamp(t_discrete, 0, 255)  # Ensure indices are in valid range
         logvars = self.logvar_embed(t_discrete) * 100
         
         if return_activations:

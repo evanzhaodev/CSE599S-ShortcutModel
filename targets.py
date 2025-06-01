@@ -35,14 +35,14 @@ def get_targets(
     log2_sections = np.log2(denoise_timesteps).astype(np.int32)
     if bootstrap_dt_bias == 0:
         dt_base = torch.repeat_interleave(
-            torch.tensor(log2_sections - 1 - torch.arange(log2_sections), device=device),
+            torch.arange(log2_sections - 1, -1, -1, device=device),
             bootstrap_batchsize // log2_sections
         )
         dt_base = torch.cat([dt_base, torch.zeros(bootstrap_batchsize - dt_base.shape[0], device=device)])
         num_dt_cfg = bootstrap_batchsize // log2_sections
     else:
         dt_base = torch.repeat_interleave(
-            torch.tensor(log2_sections - 1 - torch.arange(log2_sections - 2), device=device),
+            torch.arange(log2_sections - 3, -1, -1, device=device),
             (bootstrap_batchsize // 2) // log2_sections
         )
         dt_base = torch.cat([
@@ -89,21 +89,21 @@ def get_targets(
         
         if not bootstrap_cfg:
             # First step - get velocity
-            v_b1 = call_model_fn.forward_velocity(x_t, bst_x0, t, dt_base_bootstrap, bst_labels)
+            v_b1 = call_model_fn.forward_velocity(x_t, bst_x0, t, dt_base_bootstrap, bst_labels, train=False)
             
             # Calculate intermediate point using velocity
-            t2 = t + dt_bootstrap
+            t2 = torch.clamp(t + dt_bootstrap, 0.0, 1.0)
             x_t2 = x_t + dt_bootstrap[:, None, None, None] * v_b1
             x_t2 = torch.clamp(x_t2, -4, 4)
             
             # Get acceleration at first point
-            a_b1 = call_model_fn.forward_acceleration(x_t, v_b1, bst_x0, t, dt_base_bootstrap, bst_labels)
+            a_b1 = call_model_fn.forward_acceleration(x_t, v_b1, bst_x0, t, dt_base_bootstrap, bst_labels, train=False)
             
             # Second step - get velocity at intermediate point
-            v_b2 = call_model_fn.forward_velocity(x_t2, bst_x0, t2, dt_base_bootstrap, bst_labels)
+            v_b2 = call_model_fn.forward_velocity(x_t2, bst_x0, t2, dt_base_bootstrap, bst_labels, train=False)
             
             # Get acceleration at second point
-            a_b2 = call_model_fn.forward_acceleration(x_t2, v_b2, bst_x0, t2, dt_base_bootstrap, bst_labels)
+            a_b2 = call_model_fn.forward_acceleration(x_t2, v_b2, bst_x0, t2, dt_base_bootstrap, bst_labels, train=False)
             
             # Target is average of two steps (self-consistency)
             v_target = (v_b1 + v_b2) / 2
@@ -121,7 +121,7 @@ def get_targets(
             ], dim=0)
             
             # First step
-            v_b1_raw = call_model_fn.forward_velocity(x_t_extra, low_res_extra, t_extra, dt_base_extra, labels_extra)
+            v_b1_raw = call_model_fn.forward_velocity(x_t_extra, low_res_extra, t_extra, dt_base_extra, labels_extra, train=False)
             v_b_cond = v_b1_raw[:bst_x1.shape[0]]
             v_b_uncond = v_b1_raw[bst_x1.shape[0]:]
             
@@ -129,7 +129,7 @@ def get_targets(
             v_b1 = torch.cat([v_cfg, v_b_cond[num_dt_cfg:]], dim=0)
             
             # Get acceleration with CFG
-            a_b1_raw = call_model_fn.forward_acceleration(x_t_extra, v_b1_raw, low_res_extra, t_extra, dt_base_extra, labels_extra)
+            a_b1_raw = call_model_fn.forward_acceleration(x_t_extra, v_b1_raw, low_res_extra, t_extra, dt_base_extra, labels_extra, train=False)
             a_b_cond = a_b1_raw[:bst_x1.shape[0]]
             a_b_uncond = a_b1_raw[bst_x1.shape[0]:]
             
@@ -137,7 +137,7 @@ def get_targets(
             a_b1 = torch.cat([a_cfg, a_b_cond[num_dt_cfg:]], dim=0)
             
             # Second step
-            t2 = t + dt_bootstrap
+            t2 = torch.clamp(t + dt_bootstrap, 0.0, 1.0)
             x_t2 = x_t + dt_bootstrap[:, None, None, None] * v_b1 + \
                    (dt_bootstrap[:, None, None, None] ** 2) / 2 * a_b1
             x_t2 = torch.clamp(x_t2, -4, 4)
@@ -152,7 +152,7 @@ def get_targets(
             v_b2_cfg = v_b2_uncond + cfg_scale * (v_b2_cond[:num_dt_cfg] - v_b2_uncond)
             v_b2 = torch.cat([v_b2_cfg, v_b2_cond[num_dt_cfg:]], dim=0)
             
-            a_b2_raw = call_model_fn.forward_acceleration(x_t2_extra, v_b2_raw, low_res_extra, t2_extra, dt_base_extra, labels_extra)
+            a_b2_raw = call_model_fn.forward_acceleration(x_t2_extra, v_b2_raw, low_res_extra, t2_extra, dt_base_extra, labels_extra, train=False)
             a_b2_cond = a_b2_raw[:bst_x1.shape[0]]
             a_b2_uncond = a_b2_raw[bst_x1.shape[0]:]
             
