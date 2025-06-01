@@ -13,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import random
 import torchvision
 
-from model import DiT
+from model import DiT, HOMOModel
 from dataset import create_dataloaders
 from targets import get_targets
 from vae import StableVAE
@@ -30,7 +30,7 @@ from utils import (
 )
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train shortcut model for super-resolution')
+    parser = argparse.ArgumentParser(description='Train HOMO model for super-resolution')
     
     # Dataset arguments
     parser.add_argument('--train_dir', type=str, required=True, help='Directory with training images')
@@ -47,6 +47,12 @@ def parse_args():
     parser.add_argument('--mlp_ratio', type=int, default=4, help='MLP ratio')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
     parser.add_argument('--use_stable_vae', action='store_true', help='Use StableVAE')
+    
+    # HOMO arguments
+    parser.add_argument('--use_homo', action='store_true', help='Use HOMO (High-Order Matching)')
+    parser.add_argument('--homo_lambda_v', type=float, default=1.0, help='Weight for velocity loss')
+    parser.add_argument('--homo_lambda_a', type=float, default=1.0, help='Weight for acceleration loss')
+    parser.add_argument('--homo_lambda_sc', type=float, default=1.0, help='Weight for self-consistency loss')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
@@ -138,19 +144,36 @@ def main():
     logger.info(f"Input shape: {input_shape}")
     
     # Create model
-    model = DiT(
-        patch_size=args.patch_size,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_ratio=args.mlp_ratio,
-        out_channels=image_channels,
-        class_dropout_prob=0.1,  # Not used in our case but keep as in original
-        num_classes=1,  # Unconditional (or could be num_classes for class-conditional)
-        dropout=args.dropout,
-        use_low_res_cond=True,  # Enable low-res conditioning
-        ignore_dt=False
-    )
+    if args.use_homo:
+        logger.info("Using HOMO model with high-order matching")
+        model = HOMOModel(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
+    else:
+        logger.info("Using standard DiT model")
+        model = DiT(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
     model.to(device)
     
     # Create optimizer
@@ -161,19 +184,34 @@ def main():
     )
     
     # Create EMA model
-    ema_model = DiT(
-        patch_size=args.patch_size,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_ratio=args.mlp_ratio,
-        out_channels=image_channels,
-        class_dropout_prob=0.1,
-        num_classes=1,
-        dropout=args.dropout,
-        use_low_res_cond=True,  # Enable low-res conditioning
-        ignore_dt=False
-    )
+    if args.use_homo:
+        ema_model = HOMOModel(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
+    else:
+        ema_model = DiT(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
     ema_model.to(device)
     # Initialize EMA model with model weights
     for param, ema_param in zip(model.parameters(), ema_model.parameters()):
@@ -228,29 +266,75 @@ def main():
                     x_hr = vae.encode(x_hr)
                     x_lr = vae.encode(x_lr)
             
-            # Get targets for shortcut model (implements the noise-to-data flow with shortcuts)
-            x_t, v_t, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
-                batch_size=args.batch_size,
-                x_1=x_hr,  # Target high-res images
-                x_0=x_lr,  # Low-res conditioning
-                model=ema_model if global_step > 0 else None,
-                use_ema=args.bootstrap_ema,
-                bootstrap_every=args.bootstrap_every,
-                bootstrap_ema=args.bootstrap_ema,
-                bootstrap_cfg=args.bootstrap_cfg,  # Enable CFG for bootstrap
-                bootstrap_dt_bias=args.bootstrap_dt_bias,
-                denoise_timesteps=args.denoise_timesteps,
-                cfg_scale=args.cfg_scale,  # CFG scale
-                num_classes=1,  # Unconditional for now
-                device=device
-            )
-            
-            # Forward pass with conditioning on low-res image
-            v_pred = model(x_t, x_low_res, t, dt_base, labels)
-            
-            # Compute loss
-            mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
-            loss = torch.mean(mse_v)
+            # Get targets
+            if args.use_homo:
+                x_t, v_t, a_t, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
+                    batch_size=args.batch_size,
+                    x_1=x_hr,
+                    x_0=x_lr,
+                    model=ema_model if global_step > 0 else None,
+                    use_ema=args.bootstrap_ema,
+                    bootstrap_every=args.bootstrap_every,
+                    bootstrap_ema=args.bootstrap_ema,
+                    bootstrap_cfg=args.bootstrap_cfg,
+                    bootstrap_dt_bias=args.bootstrap_dt_bias,
+                    denoise_timesteps=args.denoise_timesteps,
+                    cfg_scale=args.cfg_scale,
+                    num_classes=1,
+                    device=device,
+                    use_homo=True
+                )
+                
+                # Forward pass
+                v_pred = model.forward_velocity(x_t, x_low_res, t, dt_base, labels)
+                a_pred = model.forward_acceleration(x_t, v_pred, x_low_res, t, dt_base, labels)
+                
+                # Self-consistency target for velocity
+                with torch.no_grad():
+                    # Take a small step
+                    d = 1.0 / args.denoise_timesteps
+                    x_next = x_t + d * v_pred + (d**2 / 2) * a_pred
+                    x_next = torch.clamp(x_next, -4, 4)
+                    
+                    # Get velocity at next step
+                    v_next = model.forward_velocity(x_next, x_low_res, t + d, dt_base, labels)
+                    v_sc_target = (v_pred + v_next) / 2
+                
+                # Compute losses
+                loss_v = torch.mean((v_pred - v_t) ** 2)
+                loss_a = torch.mean((a_pred - a_t) ** 2)
+                loss_sc = torch.mean((v_pred - v_sc_target) ** 2)
+                
+                # Total loss with weights
+                loss = args.homo_lambda_v * loss_v + \
+                       args.homo_lambda_a * loss_a + \
+                       args.homo_lambda_sc * loss_sc
+                
+            else:
+                # Original training without HOMO
+                x_t, v_t, _, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
+                    batch_size=args.batch_size,
+                    x_1=x_hr,
+                    x_0=x_lr,
+                    model=ema_model if global_step > 0 else None,
+                    use_ema=args.bootstrap_ema,
+                    bootstrap_every=args.bootstrap_every,
+                    bootstrap_ema=args.bootstrap_ema,
+                    bootstrap_cfg=args.bootstrap_cfg,
+                    bootstrap_dt_bias=args.bootstrap_dt_bias,
+                    denoise_timesteps=args.denoise_timesteps,
+                    cfg_scale=args.cfg_scale,
+                    num_classes=1,
+                    device=device,
+                    use_homo=False
+                )
+                
+                # Forward pass
+                v_pred = model(x_t, x_low_res, t, dt_base, labels)
+                
+                # Compute loss
+                mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
+                loss = torch.mean(mse_v)
             
             # Backward pass
             optimizer.zero_grad()
@@ -283,26 +367,39 @@ def main():
                     'train/lr': lr,
                 }
                 
-                # Add flow/bootstrap loss metrics if available
-                if 'loss_flow' in info:
-                    log_dict['train/loss_flow'] = info['loss_flow']
-                if 'loss_bootstrap' in info:
-                    log_dict['train/loss_bootstrap'] = info['loss_bootstrap']
+                if args.use_homo:
+                    log_dict['train/loss_velocity'] = loss_v.item()
+                    log_dict['train/loss_acceleration'] = loss_a.item()
+                    log_dict['train/loss_self_consistency'] = loss_sc.item()
+                
+                # Add info metrics
+                for k, v in info.items():
+                    if isinstance(v, torch.Tensor):
+                        log_dict[f'train/{k}'] = v.item()
                 
                 # Add to tensorboard
                 for k, v in log_dict.items():
                     writer.add_scalar(k, v, global_step)
                 
                 # Log to console
-                logger.info(
-                    f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
-                    f"Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
-                )
+                if args.use_homo:
+                    logger.info(
+                        f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
+                        f"Loss_v: {loss_v.item():.4f}, Loss_a: {loss_a.item():.4f}, "
+                        f"Loss_sc: {loss_sc.item():.4f}, Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
+                    )
+                else:
+                    logger.info(
+                        f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
+                        f"Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
+                    )
             
             # Evaluation
             if global_step % args.eval_interval == 0:
                 model.eval()
                 val_losses = []
+                val_losses_v = []
+                val_losses_a = []
                 
                 with torch.no_grad():
                     for x_lr_val, x_hr_val in val_dataloader:
@@ -320,11 +417,12 @@ def main():
                         t_val = torch.rand(batch_size_val, device=device)
                         t_full_val = t_val.view(-1, 1, 1, 1)
                         
-                        # Interpolate between noise and high-res (not low-res to high-res)
+                        # Interpolate
                         x_t_val = (1 - t_full_val) * x_noise_val + t_full_val * x_hr_val
                         
-                        # Compute target velocity (from noise to high-res)
+                        # Compute target velocity and acceleration
                         v_t_val = x_hr_val - x_noise_val
+                        a_t_val = torch.zeros_like(v_t_val)
                         
                         # Default to flow-matching dt
                         dt_base_val = torch.ones(batch_size_val, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
@@ -332,12 +430,25 @@ def main():
                         # Zero labels for unconditional
                         labels_val = torch.zeros(batch_size_val, dtype=torch.long, device=device)
                         
-                        # Forward pass with low-res conditioning
-                        v_pred_val = model(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
-                        
-                        # Compute loss
-                        mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
-                        val_loss = torch.mean(mse_v_val)
+                        if args.use_homo:
+                            # Forward pass
+                            v_pred_val = model.forward_velocity(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
+                            a_pred_val = model.forward_acceleration(x_t_val, v_pred_val, x_lr_val, t_val, dt_base_val, labels_val)
+                            
+                            # Compute losses
+                            loss_v_val = torch.mean((v_pred_val - v_t_val) ** 2)
+                            loss_a_val = torch.mean((a_pred_val - a_t_val) ** 2)
+                            val_loss = loss_v_val + loss_a_val
+                            
+                            val_losses_v.append(loss_v_val.item())
+                            val_losses_a.append(loss_a_val.item())
+                        else:
+                            # Forward pass
+                            v_pred_val = model(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
+                            
+                            # Compute loss
+                            mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
+                            val_loss = torch.mean(mse_v_val)
                         
                         val_losses.append(val_loss.item())
                 
@@ -346,7 +457,15 @@ def main():
                 
                 # Log validation loss
                 writer.add_scalar('val/loss', avg_val_loss, global_step)
-                logger.info(f"Validation Loss: {avg_val_loss:.4f}")
+                
+                if args.use_homo:
+                    avg_val_loss_v = np.mean(val_losses_v)
+                    avg_val_loss_a = np.mean(val_losses_a)
+                    writer.add_scalar('val/loss_velocity', avg_val_loss_v, global_step)
+                    writer.add_scalar('val/loss_acceleration', avg_val_loss_a, global_step)
+                    logger.info(f"Validation Loss: {avg_val_loss:.4f}, Loss_v: {avg_val_loss_v:.4f}, Loss_a: {avg_val_loss_a:.4f}")
+                else:
+                    logger.info(f"Validation Loss: {avg_val_loss:.4f}")
                 
                 # Generate samples for visualization
                 with torch.no_grad():
@@ -359,7 +478,8 @@ def main():
                         x_low_res=x_lr_sample,
                         steps=1,
                         device=device,
-                        cfg_scale=args.cfg_scale
+                        cfg_scale=args.cfg_scale,
+                        use_homo=args.use_homo
                     )
                     
                     # Generate multi-step sample (e.g., 8 steps)
@@ -368,7 +488,8 @@ def main():
                         x_low_res=x_lr_sample,
                         steps=8,
                         device=device,
-                        cfg_scale=args.cfg_scale
+                        cfg_scale=args.cfg_scale,
+                        use_homo=args.use_homo
                     )
                     
                     # Decode if using VAE
@@ -378,7 +499,6 @@ def main():
                         multi_step_images = vae.decode(multi_step_images)
                     
                     # Visualize
-                    # Concatenate low-res, one-step, multi-step
                     all_images = torch.cat([x_lr_sample, one_step_images, multi_step_images], dim=0)
                     grid = torchvision.utils.make_grid(
                         all_images.permute(0, 3, 1, 2), 
@@ -443,16 +563,17 @@ def main():
     
     logger.info("Training completed!")
 
-def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
+def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0, use_homo=False):
     """
-    Generate sample using the shortcut model.
+    Generate sample using the model.
     
     Args:
-        model: Shortcut model
+        model: Model (DiT or HOMOModel)
         x_low_res: Low-resolution conditioning input [B, H, W, C]
         steps: Number of denoising steps
         device: Device to use
         cfg_scale: Classifier-free guidance scale
+        use_homo: Whether to use HOMO sampling
         
     Returns:
         Generated high-resolution image [B, H, W, C]
@@ -479,24 +600,30 @@ def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
     
     # Denoising loop
     for step in range(steps):
-        # Forward pass to get velocity with low-res conditioning
         with torch.no_grad():
-            # If using CFG, we need to do two forward passes
-            if cfg_scale > 0:
-                # Conditional pass
-                v_cond = model(x, x_low_res, t, dt_base, labels)
+            if use_homo:
+                # Get velocity and acceleration
+                v = model.forward_velocity(x, x_low_res, t, dt_base, labels)
+                a = model.forward_acceleration(x, v, x_low_res, t, dt_base, labels)
                 
-                # Unconditional pass (using null labels or special technique for unconditional generation)
-                # Here we use the same inputs but with null labels
-                v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
-                
-                # Apply classifier-free guidance
-                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                # Update using second-order integration
+                x = x + v * d + a * (d**2 / 2)
             else:
-                v = model(x, x_low_res, t, dt_base, labels)
-        
-        # Update x using Euler method
-        x = x + v * d
+                # Original first-order update
+                if cfg_scale > 0:
+                    # Conditional pass
+                    v_cond = model(x, x_low_res, t, dt_base, labels)
+                    
+                    # Unconditional pass
+                    v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                    
+                    # Apply classifier-free guidance
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = model(x, x_low_res, t, dt_base, labels)
+                
+                # Update x using Euler method
+                x = x + v * d
         
         # Update time
         t = t + d
