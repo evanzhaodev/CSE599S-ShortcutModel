@@ -286,8 +286,8 @@ class FinalLayer(nn.Module):
         
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        
+        self.tc.kern_init()(self.output_proj)
         
     def forward(self, x, c):
         c = F.silu(c)
