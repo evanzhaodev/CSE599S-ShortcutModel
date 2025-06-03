@@ -8,12 +8,12 @@ import torchvision.transforms as transforms
 from torchvision.utils import save_image
 import glob
 
-from model import DiT
+from model import DiT, HOMOModel
 from vae import StableVAE
 from utils import load_json, process_image
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Inference with shortcut model for super-resolution')
+    parser = argparse.ArgumentParser(description='Inference with HOMO/shortcut model for super-resolution')
     
     # Input/output arguments
     parser.add_argument('--input_dir', type=str, required=True, help='Directory with low-resolution images')
@@ -21,15 +21,18 @@ def parse_args():
     parser.add_argument('--model_path', type=str, required=True, help='Path to model checkpoint')
     parser.add_argument('--config_path', type=str, required=True, help='Path to model config file')
     
+    # Model arguments
+    parser.add_argument('--use_homo', action='store_true', help='Use HOMO model (high-order matching)')
+    parser.add_argument('--use_ema', action='store_true', help='Use EMA model weights')
+    
     # Inference arguments
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size for inference')
     parser.add_argument('--steps', type=int, default=1, help='Number of denoising steps')
-    parser.add_argument('--use_ema', action='store_true', help='Use EMA model weights')
     parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale')
     
     return parser.parse_args()
 
-def load_model(config, checkpoint_path, device, use_ema=False):
+def load_model(config, checkpoint_path, device, use_ema=False, use_homo=False):
     """
     Load model from checkpoint.
     
@@ -38,24 +41,42 @@ def load_model(config, checkpoint_path, device, use_ema=False):
         checkpoint_path: Path to checkpoint
         device: Device to load model on
         use_ema: Whether to use EMA weights
+        use_homo: Whether to use HOMO model
         
     Returns:
         Loaded model
     """
-    # Create model
-    model = DiT(
-        patch_size=config['patch_size'],
-        hidden_size=config['hidden_size'],
-        depth=config['depth'],
-        num_heads=config['num_heads'],
-        mlp_ratio=config['mlp_ratio'],
-        out_channels=config.get('image_channels', 4 if config.get('use_stable_vae', False) else 3),
-        class_dropout_prob=0.1,  # Not used but keep as in original
-        num_classes=1,  # Unconditional
-        dropout=config.get('dropout', 0.0),
-        use_low_res_cond=True,  # Enable low-res conditioning
-        ignore_dt=False
-    )
+    # Check if config indicates HOMO model
+    if use_homo or config.get('use_homo', False):
+        print("Loading HOMO model")
+        model = HOMOModel(
+            patch_size=config['patch_size'],
+            hidden_size=config['hidden_size'],
+            depth=config['depth'],
+            num_heads=config['num_heads'],
+            mlp_ratio=config['mlp_ratio'],
+            out_channels=config.get('image_channels', 4 if config.get('use_stable_vae', False) else 3),
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=config.get('dropout', 0.0),
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
+    else:
+        print("Loading standard DiT model")
+        model = DiT(
+            patch_size=config['patch_size'],
+            hidden_size=config['hidden_size'],
+            depth=config['depth'],
+            num_heads=config['num_heads'],
+            mlp_ratio=config['mlp_ratio'],
+            out_channels=config.get('image_channels', 4 if config.get('use_stable_vae', False) else 3),
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=config.get('dropout', 0.0),
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
     
     try:
         # First try loading with weights_only=True (safer)
@@ -129,16 +150,17 @@ def prepare_image(image_path, image_size, low_res_factor):
     
     return low_res, high_res
 
-def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
+def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0, use_homo=False):
     """
-    Generate sample using the shortcut model.
+    Generate sample using the model.
     
     Args:
-        model: Shortcut model
+        model: Model (DiT or HOMOModel)
         x_low_res: Low-resolution conditioning input [B, H, W, C]
         steps: Number of denoising steps
         device: Device to use
         cfg_scale: Classifier-free guidance scale
+        use_homo: Whether to use HOMO sampling
         
     Returns:
         Generated high-resolution image [B, H, W, C]
@@ -165,27 +187,46 @@ def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0):
     
     # Denoising loop
     for step in range(steps):
-        # Forward pass to get velocity with low-res conditioning
         with torch.no_grad():
-            # If using CFG, we need to do two forward passes
-            if cfg_scale > 0:
-                # Conditional pass
-                v_cond = model(x, x_low_res, t, dt_base, labels)
+            if use_homo:
+                # Get velocity and acceleration
+                v = model.forward_velocity(x, x_low_res, t, dt_base, labels, train=False)
+                a = model.forward_acceleration(x, v, x_low_res, t, dt_base, labels, train=False)
                 
-                # Unconditional pass (using null labels or special technique for unconditional generation)
-                # Here we use the same inputs but with null labels
-                v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                if cfg_scale > 0:
+                    # Also compute unconditional for CFG
+                    v_uncond = model.forward_velocity(x, x_low_res, t, dt_base, 
+                                                    torch.ones_like(labels) * model.u1.num_classes, train=False)
+                    a_uncond = model.forward_acceleration(x, v_uncond, x_low_res, t, dt_base, 
+                                                        torch.ones_like(labels) * model.u1.num_classes, train=False)
+                    
+                    # Apply CFG
+                    v = v_uncond + cfg_scale * (v - v_uncond)
+                    a = a_uncond + cfg_scale * (a - a_uncond)
                 
-                # Apply classifier-free guidance
-                v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                # Update using second-order integration
+                x = x + v * d + a * (d**2 / 2)
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
             else:
-                v = model(x, x_low_res, t, dt_base, labels)
-        
-        # Update x using Euler method
-        x = x + v * d
+                # Original first-order update
+                if cfg_scale > 0:
+                    # Conditional pass
+                    v_cond = model(x, x_low_res, t, dt_base, labels)
+                    
+                    # Unconditional pass
+                    v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                    
+                    # Apply classifier-free guidance
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = model(x, x_low_res, t, dt_base, labels)
+                
+                # Update x using Euler method
+                x = x + v * d
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
         
         # Update time
-        t = t + d
+        t = torch.clamp(t + d, 0.0, 1.0)
     
     return x
 
@@ -202,8 +243,11 @@ def main():
     # Load config
     config = load_json(args.config_path)
     
+    # Determine if we should use HOMO
+    use_homo = args.use_homo or config.get('use_homo', False)
+    
     # Load model
-    model = load_model(config, args.model_path, device, args.use_ema)
+    model = load_model(config, args.model_path, device, args.use_ema, use_homo)
     
     # Create VAE if needed
     if config.get('use_stable_vae', False):
@@ -216,7 +260,7 @@ def main():
     
     # Get all image files in input directory
     image_paths = []
-    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPEG']:
+    for ext in ['*.jpg', '*.jpeg', '*.png', '*.JPEG', '*.JPG', '*.PNG']:
         image_paths.extend(glob.glob(os.path.join(args.input_dir, "**", ext), recursive=True))
     
     print(f"Found {len(image_paths)} images")
@@ -253,7 +297,8 @@ def main():
             x_low_res=batch_low_res, 
             steps=args.steps,
             device=device,
-            cfg_scale=args.cfg_scale
+            cfg_scale=args.cfg_scale,
+            use_homo=use_homo
         )
         
         # Decode with VAE if needed
@@ -264,8 +309,14 @@ def main():
         
         # Save images
         for j in range(batch_size):
+            # Create subdirectory structure if it exists in input
+            relative_path = os.path.relpath(batch_paths[j], args.input_dir)
+            relative_dir = os.path.dirname(relative_path)
+            output_subdir = os.path.join(args.output_dir, relative_dir)
+            os.makedirs(output_subdir, exist_ok=True)
+            
             output_name = f"{os.path.splitext(original_names[j])[0]}_sr.png"
-            output_path = os.path.join(args.output_dir, output_name)
+            output_path = os.path.join(output_subdir, output_name)
             
             # Convert to [C, H, W] for saving
             high_res_img = batch_high_res[j].permute(2, 0, 1)
@@ -279,7 +330,7 @@ def main():
             )
             
             # For comparison, also save the low-res input
-            low_res_output_path = os.path.join(args.output_dir, f"{os.path.splitext(original_names[j])[0]}_lr.png")
+            low_res_output_path = os.path.join(output_subdir, f"{os.path.splitext(original_names[j])[0]}_lr.png")
             low_res_img = batch_low_res[j].permute(2, 0, 1)
             save_image(
                 low_res_img,
