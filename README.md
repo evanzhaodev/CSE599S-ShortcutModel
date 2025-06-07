@@ -1,9 +1,9 @@
 # CSE599S-ShortcutModel
 
 ## Project Description
-We explore one-step flow matching for image super-resolution by extending shortcut models to use image conditions
+We explore one-step flow matching for image super-resolution by extending [shortcut models](https://github.com/kvfrans/shortcut-models) to use image conditions
 instead of text prompts. Our goal is to evaluate whether image-conditioned shortcut models can achieve high-quality
-super-resolution with minimal compute, and whether higher-order flow matching improves performance over standard
+super-resolution with minimal compute, and whether [higher-order flow matching](https://arxiv.org/html/2502.00688v1) improves performance over standard
 first-order velocity matching.
 
 ## Training
