@@ -1,5 +1,6 @@
 # CSE599S-ShortcutModel
-
+![Model output at different steps](figures/example1.png "Example")
+![Model output at different scales](figures/example2.png "Example")
 ## Project Description
 We explore one-step flow matching for image super-resolution by extending shortcut models to use image conditions
 instead of text prompts. Our goal is to evaluate whether image-conditioned shortcut models can achieve high-quality
@@ -58,3 +59,6 @@ python inference.py \
 ```
 
 ## Checkpoints
+We share two checkpoints along with their argconfig and training logs for both velocity and velocity + acceleration based flow matching.
+The velocity based was trained with 310000 steps with a batch size of 96 and velocity + acceleration based was trained with 105000 steps with a batch size of 32. Both were trained on a single H200 on UW Hyak.
+You can find the files here: [link to shared folder](https://drive.google.com/drive/folders/17RDc0iYNAZ2WPPajUQHcn_84hGZl_uTf?usp=sharing)
