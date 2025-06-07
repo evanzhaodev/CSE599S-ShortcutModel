@@ -12,9 +12,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import random
 import torchvision
-from transformers import CLIPProcessor, CLIPVisionModel
 
-from model import DiT
+from model import DiT, HOMOModel
 from dataset import create_dataloaders
 from targets import get_targets
 from vae import StableVAE
@@ -31,7 +30,7 @@ from utils import (
 )
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train shortcut model for super-resolution')
+    parser = argparse.ArgumentParser(description='Train HOMO model for super-resolution')
     
     # Dataset arguments
     parser.add_argument('--train_dir', type=str, required=True, help='Directory with training images')
@@ -48,6 +47,12 @@ def parse_args():
     parser.add_argument('--mlp_ratio', type=int, default=4, help='MLP ratio')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate')
     parser.add_argument('--use_stable_vae', action='store_true', help='Use StableVAE')
+    
+    # HOMO arguments
+    parser.add_argument('--use_homo', action='store_true', help='Use HOMO (High-Order Matching)')
+    parser.add_argument('--homo_lambda_v', type=float, default=1.0, help='Weight for velocity loss')
+    parser.add_argument('--homo_lambda_a', type=float, default=1.0, help='Weight for acceleration loss')
+    parser.add_argument('--homo_lambda_sc', type=float, default=1.0, help='Weight for self-consistency loss')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
@@ -68,6 +73,8 @@ def parse_args():
     parser.add_argument('--bootstrap_every', type=int, default=8, help='Bootstrap every N samples')
     parser.add_argument('--bootstrap_ema', type=int, default=1, help='Use EMA for bootstrap')
     parser.add_argument('--bootstrap_dt_bias', type=int, default=0, help='Bias for dt sampling')
+    parser.add_argument('--cfg_scale', type=float, default=0.0, help='Classifier-free guidance scale')
+    parser.add_argument('--bootstrap_cfg', type=float, default=0.0, help='CFG scale for bootstrap')
     
     # Checkpoint arguments
     parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
@@ -83,108 +90,6 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-def create_clip_embedder():
-    """Create a CLIP vision model for image embeddings"""
-    processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    model = CLIPVisionModel.from_pretrained("openai/clip-vit-base-patch32")
-    model.eval()  # Set to evaluation mode
-    
-    # Freeze the model parameters
-    for param in model.parameters():
-        param.requires_grad = False
-        
-    return processor, model
-
-def get_clip_embeddings(images, processor, clip_model, device):
-    """
-    Get CLIP embeddings for images
-    
-    Args:
-        images: Images tensor in range [-1, 1], shape [B, H, W, C]
-        processor: CLIP processor
-        clip_model: CLIP vision model
-        device: Device to use
-        
-    Returns:
-        Embeddings tensor, shape [B, 768]
-    """
-    # Convert from [-1, 1] to [0, 1] range
-    images = (images + 1) / 2
-    
-    # Convert to correct format for CLIP
-    images = images.permute(0, 3, 1, 2)  # [B, C, H, W]
-    # Don't scale to [0, 255] - keep in [0, 1] range for the processor
-    
-    # Convert to PIL images for the processor
-    processed_images = []
-    for img in images:
-        # Ensure we have 3 channels (RGB)
-        if img.shape[0] == 4:  # If 4 channels, take first 3
-            img = img[:3]
-        
-        # Resize to CLIP expected size
-        img = F.interpolate(img.unsqueeze(0), size=(224, 224), mode='bilinear', align_corners=False).squeeze(0)
-        processed_images.append(img.to(device))
-    
-    # Process images with CLIP processor - passing tensors in [0, 1] range
-    pixel_values = processor(images=processed_images, return_tensors="pt", do_rescale=False).pixel_values
-    pixel_values = pixel_values.to(device)
-    
-    # Get embeddings from CLIP model
-    with torch.no_grad():
-        outputs = clip_model(pixel_values)
-        embeddings = outputs.pooler_output  # [B, 768]
-    
-    return embeddings
-
-def generate_sample(model, x_0, clip_embeddings, steps=1, device=None):
-    """
-    Generate sample using the shortcut model.
-    
-    Args:
-        model: Shortcut model
-        x_0: Low-resolution input [B, H, W, C]
-        clip_embeddings: CLIP embeddings for conditioning
-        steps: Number of denoising steps
-        device: Device to use
-        
-    Returns:
-        Generated high-resolution image [B, H, W, C]
-    """
-    if device is None:
-        device = next(model.parameters()).device
-    
-    batch_size = x_0.shape[0]
-    
-    # Start from low-resolution image
-    x = x_0.clone()
-    
-    # Calculate step size
-    d = 1.0 / steps
-    
-    # Initialize current time
-    t = torch.zeros(batch_size, device=device)
-    
-    # For timestep conditioning
-    dt_base = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(steps))
-    
-    # Use CLIP embeddings for conditioning
-    labels = clip_embeddings
-    
-    # Denoising loop
-    for step in range(steps):
-        # Forward pass to get velocity
-        with torch.no_grad():
-            v = model(x, t, dt_base, labels)
-        
-        # Update x using Euler method
-        x = x + v * d
-        
-        # Update time
-        t = t + d
-    
-    return x
 
 def main():
     args = parse_args()
@@ -203,11 +108,6 @@ def main():
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
-    
-    # Create CLIP embedder
-    clip_processor, clip_model = create_clip_embedder()
-    clip_model.to(device)
-    logger.info("Created CLIP embedder")
     
     # Create dataloaders
     train_dataloader, val_dataloader = create_dataloaders(
@@ -244,19 +144,36 @@ def main():
     logger.info(f"Input shape: {input_shape}")
     
     # Create model
-    model = DiT(
-        patch_size=args.patch_size,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_ratio=args.mlp_ratio,
-        out_channels=image_channels,
-        class_dropout_prob=0.1,  # Not used in our case but keep as in original
-        num_classes=1,  # Will be replaced by CLIP embeddings
-        dropout=args.dropout,
-        ignore_dt=False,
-        is_image=True
-    )
+    if args.use_homo:
+        logger.info("Using HOMO model with high-order matching")
+        model = HOMOModel(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
+    else:
+        logger.info("Using standard DiT model")
+        model = DiT(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
     model.to(device)
     
     # Create optimizer
@@ -267,19 +184,34 @@ def main():
     )
     
     # Create EMA model
-    ema_model = DiT(
-        patch_size=args.patch_size,
-        hidden_size=args.hidden_size,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        mlp_ratio=args.mlp_ratio,
-        out_channels=image_channels,
-        class_dropout_prob=0.1,
-        num_classes=1,
-        dropout=args.dropout,
-        ignore_dt=False,
-        is_image=True
-    )
+    if args.use_homo:
+        ema_model = HOMOModel(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
+    else:
+        ema_model = DiT(
+            patch_size=args.patch_size,
+            hidden_size=args.hidden_size,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            mlp_ratio=args.mlp_ratio,
+            out_channels=image_channels,
+            class_dropout_prob=0.1,
+            num_classes=1,
+            dropout=args.dropout,
+            use_low_res_cond=True,
+            ignore_dt=False
+        )
     ema_model.to(device)
     # Initialize EMA model with model weights
     for param, ema_param in zip(model.parameters(), ema_model.parameters()):
@@ -329,50 +261,83 @@ def main():
                 
             x_lr, x_hr = x_lr.to(device), x_hr.to(device)
             
-            # Get CLIP embeddings from original low-res images before VAE encoding
-            clip_embeddings = get_clip_embeddings(x_lr, clip_processor, clip_model, device)
-            
-            # Store original batch size for later
-            original_batch_size = x_lr.shape[0]
-            
             if vae is not None:
                 with torch.no_grad():
                     x_hr = vae.encode(x_hr)
                     x_lr = vae.encode(x_lr)
             
             # Get targets
-            x_t, v_t, t, dt_base, _, info = get_targets(
-                batch_size=args.batch_size,
-                x_1=x_hr,
-                x_0=x_lr,
-                model=ema_model if global_step > 0 else None,
-                use_ema=args.bootstrap_ema,
-                bootstrap_every=args.bootstrap_every,
-                bootstrap_ema=args.bootstrap_ema,
-                bootstrap_cfg=0,  # No classifier-free guidance for super-resolution
-                bootstrap_dt_bias=args.bootstrap_dt_bias,
-                denoise_timesteps=args.denoise_timesteps,
-                cfg_scale=0.0,
-                num_classes=1,
-                device=device
-            )
-            
-            # Adjust CLIP embeddings to match the targets
-            # The bootstrap process in get_targets may have changed the batch arrangement
-            bst_size = args.batch_size // args.bootstrap_every
-            bst_size_data = args.batch_size - bst_size
-            
-            # Create combined CLIP embeddings that match the structure of x_t
-            bootstrap_embeddings = clip_embeddings[:bst_size]
-            flow_embeddings = clip_embeddings[bst_size:original_batch_size][:bst_size_data]
-            combined_clip_embeddings = torch.cat([bootstrap_embeddings, flow_embeddings], dim=0)
-            
-            # Forward pass with CLIP embeddings
-            v_pred = model(x_t, t, dt_base, combined_clip_embeddings)
-            
-            # Compute loss
-            mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
-            loss = torch.mean(mse_v)
+            if args.use_homo:
+                x_t, v_t, a_t, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
+                    batch_size=args.batch_size,
+                    x_1=x_hr,
+                    x_0=x_lr,
+                    model=ema_model if global_step > 0 else None,
+                    use_ema=args.bootstrap_ema,
+                    bootstrap_every=args.bootstrap_every,
+                    bootstrap_ema=args.bootstrap_ema,
+                    bootstrap_cfg=args.bootstrap_cfg,
+                    bootstrap_dt_bias=args.bootstrap_dt_bias,
+                    denoise_timesteps=args.denoise_timesteps,
+                    cfg_scale=args.cfg_scale,
+                    num_classes=1,
+                    device=device,
+                    use_homo=True
+                )
+                
+                # Forward pass
+                v_pred = model.forward_velocity(x_t, x_low_res, t, dt_base, labels, train=True)
+                a_pred = model.forward_acceleration(x_t, v_pred, x_low_res, t, dt_base, labels, train=True)
+                
+                # Self-consistency target for velocity
+                with torch.no_grad():
+                    model.eval()  # Ensure model is in eval mode
+                    # Take a small step
+                    d = 1.0 / args.denoise_timesteps
+                    t_next = torch.clamp(t + d, 0.0, 1.0)  # Ensure t stays in [0, 1]
+                    x_next = x_t + d * v_pred.detach() + (d**2 / 2) * a_pred.detach()
+                    x_next = torch.clamp(x_next, -4, 4)
+                    
+                    # Get velocity at next step
+                    v_next = model.forward_velocity(x_next, x_low_res, t_next, dt_base, labels, train=False)
+                    v_sc_target = (v_pred.detach() + v_next.detach()) / 2
+                    model.train()  # Set back to train mode
+                
+                # Compute losses
+                loss_v = torch.mean((v_pred - v_t) ** 2)
+                loss_a = torch.mean((a_pred - a_t) ** 2)
+                loss_sc = torch.mean((v_pred - v_sc_target.detach()) ** 2)
+                
+                # Total loss with weights
+                loss = args.homo_lambda_v * loss_v + \
+                       args.homo_lambda_a * loss_a + \
+                       args.homo_lambda_sc * loss_sc
+                
+            else:
+                # Original training without HOMO
+                x_t, v_t, _, x_noise, x_low_res, t, dt_base, labels, info = get_targets(
+                    batch_size=args.batch_size,
+                    x_1=x_hr,
+                    x_0=x_lr,
+                    model=ema_model if global_step > 0 else None,
+                    use_ema=args.bootstrap_ema,
+                    bootstrap_every=args.bootstrap_every,
+                    bootstrap_ema=args.bootstrap_ema,
+                    bootstrap_cfg=args.bootstrap_cfg,
+                    bootstrap_dt_bias=args.bootstrap_dt_bias,
+                    denoise_timesteps=args.denoise_timesteps,
+                    cfg_scale=args.cfg_scale,
+                    num_classes=1,
+                    device=device,
+                    use_homo=False
+                )
+                
+                # Forward pass
+                v_pred = model(x_t, x_low_res, t, dt_base, labels)
+                
+                # Compute loss
+                mse_v = torch.mean((v_pred - v_t) ** 2, dim=(1, 2, 3))
+                loss = torch.mean(mse_v)
             
             # Backward pass
             optimizer.zero_grad()
@@ -405,58 +370,88 @@ def main():
                     'train/lr': lr,
                 }
                 
-                # Add flow/bootstrap loss metrics if available
-                if 'loss_flow' in info:
-                    log_dict['train/loss_flow'] = info['loss_flow']
-                if 'loss_bootstrap' in info:
-                    log_dict['train/loss_bootstrap'] = info['loss_bootstrap']
+                if args.use_homo:
+                    log_dict['train/loss_velocity'] = loss_v.item()
+                    log_dict['train/loss_acceleration'] = loss_a.item()
+                    log_dict['train/loss_self_consistency'] = loss_sc.item()
+                
+                # Add info metrics
+                for k, v in info.items():
+                    if isinstance(v, torch.Tensor):
+                        log_dict[f'train/{k}'] = v.item()
                 
                 # Add to tensorboard
                 for k, v in log_dict.items():
                     writer.add_scalar(k, v, global_step)
                 
                 # Log to console
-                logger.info(
-                    f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
-                    f"Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
-                )
+                if args.use_homo:
+                    logger.info(
+                        f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
+                        f"Loss_v: {loss_v.item():.4f}, Loss_a: {loss_a.item():.4f}, "
+                        f"Loss_sc: {loss_sc.item():.4f}, Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
+                    )
+                else:
+                    logger.info(
+                        f"Epoch: {epoch}, Step: {global_step}, Loss: {loss.item():.4f}, "
+                        f"Grad Norm: {grad_norm:.4f}, LR: {lr:.6f}"
+                    )
             
             # Evaluation
             if global_step % args.eval_interval == 0:
                 model.eval()
                 val_losses = []
+                val_losses_v = []
+                val_losses_a = []
                 
                 with torch.no_grad():
                     for x_lr_val, x_hr_val in val_dataloader:
                         x_lr_val, x_hr_val = x_lr_val.to(device), x_hr_val.to(device)
                         
-                        # Get CLIP embeddings for validation images
-                        clip_embeddings_val = get_clip_embeddings(x_lr_val, clip_processor, clip_model, device)
-                        
                         if vae is not None:
                             x_hr_val = vae.encode(x_hr_val)
                             x_lr_val = vae.encode(x_lr_val)
                         
+                        # Generate random noise
+                        batch_size_val = x_lr_val.shape[0]
+                        x_noise_val = torch.randn_like(x_hr_val)
+                        
                         # Sample t uniformly
-                        batch_size = x_lr_val.shape[0]
-                        t_val = torch.rand(batch_size, device=device)
+                        t_val = torch.rand(batch_size_val, device=device)
                         t_full_val = t_val.view(-1, 1, 1, 1)
                         
-                        # Interpolate between low-res and high-res
-                        x_t_val = (1 - (1 - 1e-5) * t_full_val) * x_lr_val + t_full_val * x_hr_val
+                        # Interpolate
+                        x_t_val = (1 - t_full_val) * x_noise_val + t_full_val * x_hr_val
                         
-                        # Compute target velocity
-                        v_t_val = x_hr_val - (1 - 1e-5) * x_lr_val
+                        # Compute target velocity and acceleration
+                        v_t_val = x_hr_val - x_noise_val
+                        a_t_val = torch.zeros_like(v_t_val)
                         
                         # Default to flow-matching dt
-                        dt_base_val = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
+                        dt_base_val = torch.ones(batch_size_val, dtype=torch.int64, device=device) * int(np.log2(args.denoise_timesteps))
                         
-                        # Forward pass with CLIP embeddings
-                        v_pred_val = model(x_t_val, t_val, dt_base_val, clip_embeddings_val)
+                        # Zero labels for unconditional
+                        labels_val = torch.zeros(batch_size_val, dtype=torch.long, device=device)
                         
-                        # Compute loss
-                        mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
-                        val_loss = torch.mean(mse_v_val)
+                        if args.use_homo:
+                            # Forward pass
+                            v_pred_val = model.forward_velocity(x_t_val, x_lr_val, t_val, dt_base_val, labels_val, train=False)
+                            a_pred_val = model.forward_acceleration(x_t_val, v_pred_val, x_lr_val, t_val, dt_base_val, labels_val, train=False)
+                            
+                            # Compute losses
+                            loss_v_val = torch.mean((v_pred_val - v_t_val) ** 2)
+                            loss_a_val = torch.mean((a_pred_val - a_t_val) ** 2)
+                            val_loss = loss_v_val + loss_a_val
+                            
+                            val_losses_v.append(loss_v_val.item())
+                            val_losses_a.append(loss_a_val.item())
+                        else:
+                            # Forward pass
+                            v_pred_val = model(x_t_val, x_lr_val, t_val, dt_base_val, labels_val)
+                            
+                            # Compute loss
+                            mse_v_val = torch.mean((v_pred_val - v_t_val) ** 2, dim=(1, 2, 3))
+                            val_loss = torch.mean(mse_v_val)
                         
                         val_losses.append(val_loss.item())
                 
@@ -465,30 +460,39 @@ def main():
                 
                 # Log validation loss
                 writer.add_scalar('val/loss', avg_val_loss, global_step)
-                logger.info(f"Validation Loss: {avg_val_loss:.4f}")
+                
+                if args.use_homo:
+                    avg_val_loss_v = np.mean(val_losses_v)
+                    avg_val_loss_a = np.mean(val_losses_a)
+                    writer.add_scalar('val/loss_velocity', avg_val_loss_v, global_step)
+                    writer.add_scalar('val/loss_acceleration', avg_val_loss_a, global_step)
+                    logger.info(f"Validation Loss: {avg_val_loss:.4f}, Loss_v: {avg_val_loss_v:.4f}, Loss_a: {avg_val_loss_a:.4f}")
+                else:
+                    logger.info(f"Validation Loss: {avg_val_loss:.4f}")
                 
                 # Generate samples for visualization
                 with torch.no_grad():
                     # Choose a fixed low-res image for visualization
                     x_lr_sample = x_lr_val[:8].clone()
-                    clip_embeddings_sample = clip_embeddings_val[:8].clone()
                     
                     # Generate one-step sample
                     one_step_images = generate_sample(
                         model=ema_model,
-                        x_0=x_lr_sample,
-                        clip_embeddings=clip_embeddings_sample,
+                        x_low_res=x_lr_sample,
                         steps=1,
-                        device=device
+                        device=device,
+                        cfg_scale=args.cfg_scale,
+                        use_homo=args.use_homo
                     )
                     
                     # Generate multi-step sample (e.g., 8 steps)
                     multi_step_images = generate_sample(
                         model=ema_model,
-                        x_0=x_lr_sample,
-                        clip_embeddings=clip_embeddings_sample,
+                        x_low_res=x_lr_sample,
                         steps=8,
-                        device=device
+                        device=device,
+                        cfg_scale=args.cfg_scale,
+                        use_homo=args.use_homo
                     )
                     
                     # Decode if using VAE
@@ -498,7 +502,6 @@ def main():
                         multi_step_images = vae.decode(multi_step_images)
                     
                     # Visualize
-                    # Concatenate low-res, one-step, multi-step
                     all_images = torch.cat([x_lr_sample, one_step_images, multi_step_images], dim=0)
                     grid = torchvision.utils.make_grid(
                         all_images.permute(0, 3, 1, 2), 
@@ -562,6 +565,75 @@ def main():
     )
     
     logger.info("Training completed!")
+
+def generate_sample(model, x_low_res, steps=1, device=None, cfg_scale=0.0, use_homo=False):
+    """
+    Generate sample using the model.
+    
+    Args:
+        model: Model (DiT or HOMOModel)
+        x_low_res: Low-resolution conditioning input [B, H, W, C]
+        steps: Number of denoising steps
+        device: Device to use
+        cfg_scale: Classifier-free guidance scale
+        use_homo: Whether to use HOMO sampling
+        
+    Returns:
+        Generated high-resolution image [B, H, W, C]
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    
+    batch_size = x_low_res.shape[0]
+    
+    # Start from pure noise
+    x = torch.randn_like(x_low_res, device=device)
+    
+    # Calculate step size
+    d = 1.0 / steps
+    
+    # Initialize current time
+    t = torch.zeros(batch_size, device=device)
+    
+    # For timestep conditioning
+    dt_base = torch.ones(batch_size, dtype=torch.int64, device=device) * int(np.log2(steps))
+    
+    # Zero labels for unconditional
+    labels = torch.zeros(batch_size, dtype=torch.long, device=device)
+    
+    # Denoising loop
+    for step in range(steps):
+        with torch.no_grad():
+            if use_homo:
+                # Get velocity and acceleration
+                v = model.forward_velocity(x, x_low_res, t, dt_base, labels, train=False)
+                a = model.forward_acceleration(x, v, x_low_res, t, dt_base, labels, train=False)
+                
+                # Update using second-order integration
+                x = x + v * d + a * (d**2 / 2)
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
+            else:
+                # Original first-order update
+                if cfg_scale > 0:
+                    # Conditional pass
+                    v_cond = model(x, x_low_res, t, dt_base, labels)
+                    
+                    # Unconditional pass
+                    v_uncond = model(x, x_low_res, t, dt_base, torch.ones_like(labels) * model.num_classes)
+                    
+                    # Apply classifier-free guidance
+                    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                else:
+                    v = model(x, x_low_res, t, dt_base, labels)
+                
+                # Update x using Euler method
+                x = x + v * d
+                x = torch.clamp(x, -4, 4)  # Clamp to prevent instability
+        
+        # Update time
+        t = torch.clamp(t + d, 0.0, 1.0)
+    
+    return x
 
 if __name__ == '__main__':
     main()

@@ -5,8 +5,6 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 def modulate(x, shift, scale):
-    # Original JAX code: x * (1 + scale[:, None]) + shift[:, None]
-    # scale = torch.clamp(scale, -1, 1)
     return x * (1 + scale[:, None]) + shift[:, None]
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -28,13 +26,11 @@ def get_1d_sincos_pos_embed(embed_dim, length, device=None):
     return emb.unsqueeze(0)
 
 def get_2d_sincos_pos_embed(embed_dim, length, device=None):
-    # example: embed_dim = 256, length = 16*16
     grid_size = int(length ** 0.5)
     assert grid_size * grid_size == length
     
     def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
         assert embed_dim % 2 == 0
-        # use half of dimensions to encode grid_h
         emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
         emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
         emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
@@ -42,7 +38,7 @@ def get_2d_sincos_pos_embed(embed_dim, length, device=None):
     
     grid_h = torch.arange(grid_size, dtype=torch.float, device=device)
     grid_w = torch.arange(grid_size, dtype=torch.float, device=device)
-    grid = torch.meshgrid(grid_w, grid_h, indexing='ij')  # here w goes first
+    grid = torch.meshgrid(grid_w, grid_h, indexing='ij')
     grid = torch.stack(grid, dim=0)
     grid = grid.reshape([2, 1, grid_size, grid_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
@@ -79,11 +75,9 @@ class TimestepEmbedder(nn.Module):
         self.mlp1 = nn.Linear(frequency_embedding_size, hidden_size)
         self.mlp2 = nn.Linear(hidden_size, hidden_size)
         
-        # Initialize with normal instead of xavier for time embedder
         nn.init.normal_(self.mlp1.weight, std=0.02)
         nn.init.normal_(self.mlp2.weight, std=0.02)
         
-        # Apply initializers for biases
         self.tc.kern_init('time_bias', zero=True)(self.mlp1)
         self.tc.kern_init('time_bias')(self.mlp2)
         
@@ -94,11 +88,7 @@ class TimestepEmbedder(nn.Module):
         x = self.mlp2(x)
         return x
     
-    # t is between [0, 1]
     def timestep_embedding(self, t, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        """
         t = t.float()
         half = self.frequency_embedding_size // 2
         freqs = torch.exp(
@@ -126,23 +116,6 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
-class CLIPEmbedder(nn.Module):
-    """
-    Processes CLIP embeddings to match the hidden size
-    """
-    def __init__(self, hidden_size, tc):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.tc = tc
-        
-        # Project CLIP embeddings (768) to hidden size
-        self.projection = nn.Linear(768, hidden_size)
-        self.tc.kern_init()(self.projection)
-    
-    def forward(self, embeddings):
-        # Project to the correct dimension
-        return self.projection(embeddings)
-
 class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     def __init__(self, patch_size, hidden_size, tc, bias=True):
@@ -160,7 +133,6 @@ class PatchEmbed(nn.Module):
             bias=bias
         )
         
-        # Apply initializers
         self.tc.kern_init('patch')(self.proj)
         if bias:
             self.tc.kern_init('patch_bias', zero=True)(self.proj)
@@ -169,12 +141,10 @@ class PatchEmbed(nn.Module):
         B, H, W, C = x.shape
         num_patches = H // self.patch_size
         
-        # Transpose for Conv2d which expects [B, C, H, W]
         x = x.permute(0, 3, 1, 2)
         x = self.proj(x)
         
-        # Reshape to match JAX output format [B, num_patches*num_patches, hidden_size]
-        x = x.permute(0, 2, 3, 1)  # [B, num_patches, num_patches, hidden_size]
+        x = x.permute(0, 2, 3, 1)
         x = rearrange(x, 'b h w c -> b (h w) c', h=num_patches, w=num_patches)
         return x
 
@@ -187,25 +157,21 @@ class MlpBlock(nn.Module):
         self.out_dim = out_dim
         self.dropout_rate = dropout_rate
         
-        # Pre-initialize the layers with default sizes to match the saved state dict
-        self.fc1 = nn.Linear(768, mlp_dim)  # Default hidden size is typically 768
-        self.fc2 = nn.Linear(mlp_dim, 768)  # Default output is same as input
+        self.fc1 = nn.Linear(1152, mlp_dim)
+        self.fc2 = nn.Linear(mlp_dim, 1152)
         
-        # Initialize weights
         self.tc.kern_init()(self.fc1)
         self.tc.kern_init()(self.fc2)
         
         self.dropout = nn.Dropout(dropout_rate) if dropout_rate is not None else nn.Identity()
     
     def _update_fc1_if_needed(self, in_dim, device):
-        # If dimensions don't match, recreate the layer
         if self.fc1.in_features != in_dim:
             old_fc1 = self.fc1
             self.fc1 = nn.Linear(in_dim, self.mlp_dim).to(device)
             self.tc.kern_init()(self.fc1)
             
     def _update_fc2_if_needed(self, out_dim, device):
-        # If dimensions don't match, recreate the layer
         if self.fc2.out_features != out_dim:
             old_fc2 = self.fc2
             self.fc2 = nn.Linear(self.mlp_dim, out_dim).to(device)
@@ -215,17 +181,14 @@ class MlpBlock(nn.Module):
         device = inputs.device
         actual_out_dim = inputs.shape[-1] if self.out_dim is None else self.out_dim
         
-        # Update layers if dimensions don't match
         self._update_fc1_if_needed(inputs.shape[-1], device)
         self._update_fc2_if_needed(actual_out_dim, device)
         
-        # Move layers to the correct device if needed
         if self.fc1.weight.device != device:
             self.fc1 = self.fc1.to(device)
         if self.fc2.weight.device != device:
             self.fc2 = self.fc2.to(device)
         
-        # Forward pass
         x = self.fc1(inputs)
         x = F.gelu(x)
         x = self.dropout(x) if train else x
@@ -245,25 +208,20 @@ class DiTBlock(nn.Module):
         self.mlp_ratio = mlp_ratio
         self.dropout = dropout
         
-        # Layer norms (without affine parameters)
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False)
         
-        # AdaLN modulation via conditioning
         self.adaLN_modulation = nn.Linear(hidden_size, 6 * hidden_size)
         self.tc.kern_init()(self.adaLN_modulation)
         
-        # Attention components
         self.q_proj = nn.Linear(hidden_size, hidden_size)
         self.k_proj = nn.Linear(hidden_size, hidden_size)
         self.v_proj = nn.Linear(hidden_size, hidden_size)
         self.attn_output = nn.Linear(hidden_size, hidden_size)
         
-        # Initialize attention components
         for layer in [self.q_proj, self.k_proj, self.v_proj, self.attn_output]:
             self.tc.kern_init()(layer)
         
-        # MLP block
         self.mlp = MlpBlock(
             mlp_dim=int(hidden_size * mlp_ratio),
             tc=tc,
@@ -271,50 +229,39 @@ class DiTBlock(nn.Module):
         )
         
     def forward(self, x, c, train=False):
-        # Process conditioning to get modulation parameters
         c = F.silu(c)
         adaLN_params = self.adaLN_modulation(c)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.split(
             adaLN_params, self.hidden_size, dim=-1
         )
         
-        # Attention block
         x_norm = self.norm1(x)
         x_norm = modulate(x_norm, shift_msa, scale_msa)
         
-        # Multi-head attention
         B, N, C = x_norm.shape
         channels_per_head = C // self.num_heads
         
-        # Query, key, value projections
         q = self.q_proj(x_norm)
         k = self.k_proj(x_norm)
         v = self.v_proj(x_norm)
         
-        # Reshape for multi-head attention
         q = q.reshape(B, N, self.num_heads, channels_per_head)
         k = k.reshape(B, N, self.num_heads, channels_per_head)
         v = v.reshape(B, N, self.num_heads, channels_per_head)
         
-        # Scale query
         q = q / math.sqrt(3)
         
-        # Compute attention
         attn = torch.einsum('bqhc,bkhc->bhqk', q, k)
-        attn = attn.float()  # For numerical stability
+        attn = attn.float()
         attn = F.softmax(attn, dim=-1)
         
-        # Apply attention to values
         y = torch.einsum('bhqk,bkhc->bqhc', attn, v)
         y = y.reshape(B, N, C)
         
-        # Output projection
         attn_output = self.attn_output(y)
         
-        # Apply gate and residual
         x = x + gate_msa[:, None] * attn_output
         
-        # MLP block
         x_norm2 = self.norm2(x)
         x_norm2 = modulate(x_norm2, shift_mlp, scale_mlp)
         mlp_output = self.mlp(x_norm2, train=train)
@@ -337,29 +284,26 @@ class FinalLayer(nn.Module):
         self.adaLN_modulation = nn.Linear(hidden_size, 2 * hidden_size)
         self.output_proj = nn.Linear(hidden_size, patch_size * patch_size * out_channels)
         
-        # Initialize with zeros for final layer
         nn.init.zeros_(self.adaLN_modulation.weight)
         nn.init.zeros_(self.adaLN_modulation.bias)
-        nn.init.zeros_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        
+        self.tc.kern_init()(self.output_proj)
         
     def forward(self, x, c):
-        # Process conditioning
         c = F.silu(c)
         adaLN_params = self.adaLN_modulation(c)
         shift, scale = torch.split(adaLN_params, self.hidden_size, dim=-1)
         
-        # Normalize and modulate
         x = self.norm(x)
         x = modulate(x, shift, scale)
         
-        # Project to output dimensions
         x = self.output_proj(x)
         return x
 
 class DiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
+    Modified for HOMO (High-Order Matching) with separate velocity and acceleration models.
     """
     def __init__(
         self,
@@ -371,10 +315,11 @@ class DiT(nn.Module):
         out_channels,
         class_dropout_prob,
         num_classes,
+        use_low_res_cond=True,
         ignore_dt=False,
         dropout=0.0,
-        is_image=False,
-        dtype=torch.float32
+        dtype=torch.float32,
+        order='first'  # 'first' for velocity only, 'second' for acceleration
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -385,39 +330,52 @@ class DiT(nn.Module):
         self.out_channels = out_channels
         self.class_dropout_prob = class_dropout_prob
         self.num_classes = num_classes
+        self.use_low_res_cond = use_low_res_cond
         self.ignore_dt = ignore_dt
         self.dropout = dropout
-        self.is_image = is_image
         self.dtype = dtype
+        self.order = order
         
-        # Create training config
         self.tc = TrainConfig(dtype=dtype)
         
-        # Patch embedding
         self.patch_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
         
-        # Time, dt, and label embedders
+        if self.use_low_res_cond:
+            self.low_res_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
+            self.concat_proj = nn.Linear(hidden_size * 2, hidden_size)
+            self.tc.kern_init()(self.concat_proj)
+        
+        # For second-order model, we need to embed the velocity input
+        if self.order == 'second':
+            self.velocity_embed = PatchEmbed(patch_size, hidden_size, tc=self.tc)
+            # Use a separate projection for velocity concatenation
+            self.velocity_concat_proj = nn.Linear(hidden_size * 2, hidden_size)
+            self.tc.kern_init()(self.velocity_concat_proj)
+        
         self.timestep_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.dt_embedder = TimestepEmbedder(hidden_size, tc=self.tc)
         self.label_embedder = LabelEmbedder(num_classes, hidden_size, tc=self.tc)
-        self.clip_embedder = CLIPEmbedder(hidden_size, tc=self.tc)
         
-        # DiT blocks
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, tc=self.tc, mlp_ratio=mlp_ratio, dropout=dropout)
             for _ in range(depth)
         ])
         
-        # Final layer
         self.final_layer = FinalLayer(patch_size, out_channels, hidden_size, tc=self.tc)
         
-        # Logvar embedding
         self.logvar_embed = nn.Embedding(256, 1)
         nn.init.zeros_(self.logvar_embed.weight)
         
-    def forward(self, x, t, dt, y, train=False, return_activations=False):
-        # (x = (B, H, W, C) image, t = (B,) timesteps, y = (B,) class labels)
-        # print(f"DiT: Input of shape {x.shape} dtype {x.dtype}")
+    def forward(self, x, low_res=None, t=None, dt=None, y=None, v=None, train=False, return_activations=False, cfg_scale=0.0):
+        """
+        Args:
+            x: (B, H, W, C) noise state
+            low_res: (B, H, W, C) low-res conditioning
+            t: (B,) timesteps
+            dt: (B,) step sizes
+            y: (B,) class labels
+            v: (B, H, W, C) velocity (only for second-order model)
+        """
         activations = {}
         
         batch_size = x.shape[0]
@@ -429,58 +387,178 @@ class DiT(nn.Module):
         if self.ignore_dt:
             dt = torch.zeros_like(t)
         
-        # Get positional embedding
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, num_patches, device=x.device)
         pos_embed = pos_embed.to(self.dtype)
         
-        # Patch embedding
-        x = self.patch_embed(x)  # (B, num_patches, hidden_size)
-        # print(f"DiT: After patch embed, shape is {x.shape} dtype {x.dtype}")
-        activations['patch_embed'] = x
+        x_embed = self.patch_embed(x)
+        activations['patch_embed'] = x_embed
         
-        # Add positional embedding
-        x = x + pos_embed
-        x = x.to(self.dtype)
+        x_embed = x_embed + pos_embed
+        x_embed = x_embed.to(self.dtype)
         
-        # Time, dt, and label embeddings
-        te = self.timestep_embedder(t)  # (B, hidden_size)
-        dte = self.dt_embedder(dt)  # (B, hidden_size)
-        if self.is_image and (y.dtype == torch.float32 or y.dtype == torch.float16):
-            ye = self.clip_embedder(y)  # (B, hidden_size)
-        else:
-            ye = self.label_embedder(y)  # (B, hidden_size)
-        c = te + ye + dte
+        # For second-order model, also embed velocity
+        if self.order == 'second' and v is not None:
+            v_embed = self.velocity_embed(v)
+            v_embed = v_embed + pos_embed
+            v_embed = v_embed.to(self.dtype)
+            # Concatenate noise and velocity embeddings
+            x_embed = torch.cat([x_embed, v_embed], dim=-1)
+            x_embed = self.velocity_concat_proj(x_embed)
         
-        # Store activations
-        activations['pos_embed'] = pos_embed
-        activations['time_embed'] = te
-        activations['dt_embed'] = dte
-        activations['label_embed'] = ye
-        activations['conditioning'] = c
-        
-        # print(f"DiT: Patch Embed of shape {x.shape} dtype {x.dtype}")
-        # print(f"DiT: Conditioning of shape {c.shape} dtype {c.dtype}")
-        
-        # Apply transformer blocks
-        for i in range(self.depth):
-            x = self.blocks[i](x, c, train=train)
-            activations[f'dit_block_{i}'] = x
+        # Process low-res conditioning if provided
+        if self.use_low_res_cond and low_res is not None:
+            low_res_embed = self.low_res_embed(low_res)
+            low_res_embed = low_res_embed + pos_embed
+            low_res_embed = low_res_embed.to(self.dtype)
+            activations['low_res_embed'] = low_res_embed
             
-        # Apply final layer
-        x = self.final_layer(x, c)  # (B, num_patches, p*p*c)
-        activations['final_layer'] = x
+            x = torch.cat([x_embed, low_res_embed], dim=-1)
+            x = self.concat_proj(x)
+            activations['concat_proj'] = x
+        else:
+            x = x_embed
         
-        # Reshape output
+        te = self.timestep_embedder(t)
+        dte = self.dt_embedder(dt)
+        
+        if cfg_scale > 0 and y is not None:
+            # Similar CFG handling as before
+            x_cond = x[:batch_size//2].clone()
+            t_cond = t[:batch_size//2].clone()
+            dt_cond = dt[:batch_size//2].clone()
+            y_cond = y[:batch_size//2].clone()
+            
+            ye_cond = self.label_embedder(y_cond)
+            c_cond = te[:batch_size//2] + ye_cond + dte[:batch_size//2]
+            
+            null_labels = torch.zeros_like(y_cond)
+            ye_uncond = self.label_embedder(null_labels)
+            c_uncond = te[:batch_size//2] + ye_uncond + dte[:batch_size//2]
+            
+            x_cond_out = x_cond.clone()
+            for i in range(self.depth):
+                x_cond_out = self.blocks[i](x_cond_out, c_cond, train=train)
+            
+            x_uncond_out = x_cond.clone()
+            for i in range(self.depth):
+                x_uncond_out = self.blocks[i](x_uncond_out, c_uncond, train=train)
+            
+            x_cond_out = self.final_layer(x_cond_out, c_cond)
+            x_uncond_out = self.final_layer(x_uncond_out, c_uncond)
+            
+            guided_output = x_uncond_out + cfg_scale * (x_cond_out - x_uncond_out)
+            
+            if batch_size > batch_size//2:
+                ye = self.label_embedder(y[batch_size//2:])
+                c = te[batch_size//2:] + ye + dte[batch_size//2:]
+                
+                x_remain = x[batch_size//2:]
+                for i in range(self.depth):
+                    x_remain = self.blocks[i](x_remain, c, train=train)
+                x_remain = self.final_layer(x_remain, c)
+                
+                x = torch.cat([guided_output, x_remain], dim=0)
+            else:
+                x = guided_output
+        else:
+            ye = self.label_embedder(y)
+            c = te + ye + dte
+            
+            activations['time_embed'] = te
+            activations['dt_embed'] = dte
+            activations['label_embed'] = ye
+            activations['conditioning'] = c
+            
+            for i in range(self.depth):
+                x = self.blocks[i](x, c, train=train)
+                activations[f'dit_block_{i}'] = x
+                
+            x = self.final_layer(x, c)
+            activations['final_layer'] = x
+        
         x = x.reshape(batch_size, num_patches_side, num_patches_side, 
-                      self.patch_size, self.patch_size, self.out_channels)
+                    self.patch_size, self.patch_size, self.out_channels)
         x = torch.einsum('bhwpqc->bhpwqc', x)
         x = rearrange(x, 'B H P W Q C -> B (H P) (W Q) C', H=int(num_patches_side), W=int(num_patches_side))
         assert x.shape == (batch_size, input_size, input_size, self.out_channels)
         
-        # Calculate logvars
         t_discrete = torch.floor(t * 256).long()
+        t_discrete = torch.clamp(t_discrete, 0, 255)  # Ensure indices are in valid range
         logvars = self.logvar_embed(t_discrete) * 100
         
         if return_activations:
             return x, logvars, activations
-        return x
+        return x, logvars
+
+
+class HOMOModel(nn.Module):
+    """
+    HOMO (High-Order Matching for One-step shortcut) Model
+    Combines first-order (velocity) and second-order (acceleration) models
+    """
+    def __init__(
+        self,
+        patch_size,
+        hidden_size,
+        depth,
+        num_heads,
+        mlp_ratio,
+        out_channels,
+        class_dropout_prob,
+        num_classes,
+        use_low_res_cond=True,
+        ignore_dt=False,
+        dropout=0.0,
+        dtype=torch.float32
+    ):
+        super().__init__()
+        
+        # First-order model (velocity)
+        self.u1 = DiT(
+            patch_size=patch_size,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            out_channels=out_channels,
+            class_dropout_prob=class_dropout_prob,
+            num_classes=num_classes,
+            use_low_res_cond=use_low_res_cond,
+            ignore_dt=ignore_dt,
+            dropout=dropout,
+            dtype=dtype,
+            order='first'
+        )
+        
+        # Second-order model (acceleration)
+        self.u2 = DiT(
+            patch_size=patch_size,
+            hidden_size=hidden_size,
+            depth=depth,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
+            out_channels=out_channels,
+            class_dropout_prob=class_dropout_prob,
+            num_classes=num_classes,
+            use_low_res_cond=use_low_res_cond,
+            ignore_dt=ignore_dt,
+            dropout=dropout,
+            dtype=dtype,
+            order='second'
+        )
+    
+    def forward_velocity(self, x, low_res=None, t=None, dt=None, y=None, train=False, cfg_scale=0.0):
+        """Forward pass for velocity (first-order) model"""
+        v, logvars = self.u1(x, low_res, t, dt, y, train=train, cfg_scale=cfg_scale)
+        return v
+    
+    def forward_acceleration(self, x, v, low_res=None, t=None, dt=None, y=None, train=False, cfg_scale=0.0):
+        """Forward pass for acceleration (second-order) model"""
+        a, logvars = self.u2(x, low_res, t, dt, y, v=v, train=train, cfg_scale=cfg_scale)
+        return a
+    
+    def forward(self, x, low_res=None, t=None, dt=None, y=None, train=False, cfg_scale=0.0):
+        """Forward pass for both velocity and acceleration"""
+        v = self.forward_velocity(x, low_res, t, dt, y, train, cfg_scale)
+        a = self.forward_acceleration(x, v, low_res, t, dt, y, train, cfg_scale)
+        return v, a
